@@ -23,36 +23,18 @@ func NewResolver() *Resolver {
 
 // Resolve обрабатывает DNS-запрос и возвращает ответ
 func (r *Resolver) Resolve(request []byte) ([]byte, error) {
-	var parser dnsmessage.Parser
-	// Вместо Start() теперь можно просто передать байты в ParseHeader()
-	// или использовать ParseAll() для полной структуры.
-	// Для начала разберем заголовок, чтобы получить ID и флаги.
-	header, err := parser.ParseHeader(request)
+	var msg dnsmessage.Message
+	err := msg.Unpack(request) // Используем Unpack для всего сообщения сразу
 	if err != nil {
-		return nil, fmt.Errorf("ошибка парсинга DNS-заголовка: %w", err)
+		return nil, fmt.Errorf("ошибка распаковки DNS-запроса: %w", err)
 	}
 
-	// Чтобы получить вопросы, нужно использовать ParseQuestion().
-	// Можно также использовать ParseAll() для получения всех разделов сразу,
-	// но для детального контроля удобнее по секциям.
-	questions := make([]dnsmessage.Question, 0)
-	for {
-		q, err := parser.ParseQuestion()
-		if err == dnsmessage.ErrSectionDone {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("ошибка парсинга DNS-вопроса: %w", err)
-		}
-		questions = append(questions, q)
-	}
-
-	if len(questions) == 0 {
+	if len(msg.Questions) == 0 {
 		return nil, fmt.Errorf("отсутствуют вопросы в DNS-запросе")
 	}
 
 	// Для простоты пока будем обрабатывать только первый вопрос
-	q := questions[0]
+	q := msg.Questions[0]
 	queryName := q.Name.String()
 	queryType := q.Type.String()
 	cacheKey := fmt.Sprintf("%s_%s", queryName, queryType)
@@ -63,38 +45,34 @@ func (r *Resolver) Resolve(request []byte) ([]byte, error) {
 
 		// Важно: в кэшированном ответе нужно изменить ID запроса на тот, что пришел от клиента
 		// Иначе клиент может отклонить ответ.
-		// Используем Message для более удобной работы с готовыми сообщениями
-		var msg dnsmessage.Message
-		err := msg.Unpack(cachedResponse)
+		var cachedMsg dnsmessage.Message
+		err := cachedMsg.Unpack(cachedResponse)
 		if err != nil {
 			log.Printf("Ошибка распаковки кэшированного ответа: %v", err)
-			// Если не можем распарсить кэшированный, то лучше попытаться резолвить заново
-			return r.recursiveResolve(request, q, header.ID)
+			return r.recursiveResolve(request, q, msg.Header.ID)
 		}
 
-		msg.Header.ID = header.ID // Устанавливаем ID из оригинального запроса
-		// Также убедимся, что вопросы соответствуют оригиналу, хотя в простом кэше
-		// мы кэшируем только один тип запроса на одно имя.
-		msg.Questions = questions 
+		cachedMsg.Header.ID = msg.Header.ID // Устанавливаем ID из оригинального запроса
+		cachedMsg.Questions = msg.Questions // Устанавливаем оригинальные вопросы
 
-		finalResponse, err := msg.Pack()
+		finalResponse, err := cachedMsg.Pack()
 		if err != nil {
 			log.Printf("Ошибка пересборки кэшированного ответа: %v", err)
-			return r.recursiveResolve(request, q, header.ID) // Снова пытаемся резолвить
+			return r.recursiveResolve(request, q, msg.Header.ID)
 		}
 		return finalResponse, nil
 	}
 
 	// 2. Если нет в кэше, начинаем рекурсивное разрешение
 	log.Printf("Начинаем рекурсивное разрешение для %s (%s)", queryName, queryType)
-	response, err := r.recursiveResolve(request, q, header.ID)
+	response, err := r.recursiveResolve(request, q, msg.Header.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	// 3. Парсим ответ, чтобы извлечь TTL и закэшировать
-	var msg dnsmessage.Message
-	err = msg.Unpack(response)
+	var responseMsg dnsmessage.Message
+	err = responseMsg.Unpack(response)
 	if err != nil {
 		log.Printf("Ошибка распаковки ответа для кэширования: %v", err)
 		return response, nil // Возвращаем ответ, даже если не можем закэшировать
@@ -103,19 +81,19 @@ func (r *Resolver) Resolve(request []byte) ([]byte, error) {
 	minTTL := uint32(3600) // Дефолтный TTL, если не найдем ничего лучше
 
 	// Ищем минимальный TTL среди ответов
-	for _, ans := range msg.Answers {
+	for _, ans := range responseMsg.Answers {
 		if ans.Header.TTL < minTTL {
 			minTTL = ans.Header.TTL
 		}
 	}
-	
-	for _, auth := range msg.Authorities {
+
+	for _, auth := range responseMsg.Authorities {
 		if auth.Header.TTL < minTTL {
 			minTTL = auth.Header.TTL
 		}
 	}
 
-	for _, add := range msg.Additionals {
+	for _, add := range responseMsg.Additionals {
 		if add.Header.TTL < minTTL {
 			minTTL = add.Header.TTL
 		}
@@ -132,7 +110,6 @@ func (r *Resolver) Resolve(request []byte) ([]byte, error) {
 // recursiveResolve выполняет рекурсивный запрос к DNS-серверам
 func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.Question, originalID uint16) ([]byte, error) {
 	// Root-серверы DNS (это список общедоступных корневых серверов)
-	// В реальном проекте этот список должен быть актуальным и возможно обновляемым
 	rootServers := []string{
 		"198.41.0.4:53",  // A.ROOT-SERVERS.NET
 		"199.9.14.201:53", // B.ROOT-SERVERS.NET
@@ -149,7 +126,6 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 		"202.12.27.33:53", // M.ROOT-SERVERS.NET
 	}
 
-	// Отправляем запрос
 	var currentServers []string = rootServers
 	var responseBytes []byte
 
@@ -162,15 +138,12 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 				log.Printf("Не удалось подключиться к %s: %v", serverAddr, err)
 				continue
 			}
-			defer conn.Close() // Закрываем соединение после использования
+			defer conn.Close()
 
-			// Строим новый запрос, чтобы убедиться, что он корректен для рекурсии
-			// Флаг Recursion Desired (RD) должен быть установлен
-			// ID запроса должен совпадать с оригинальным
 			reqMsg := dnsmessage.Message{
 				Header: dnsmessage.Header{
-					ID:            originalID,
-					RecursionDesired: true, // Мы хотим, чтобы вышестоящий сервер делал рекурсию (если может)
+					ID: originalID,
+					RecursionDesired: true,
 				},
 				Questions: []dnsmessage.Question{question},
 			}
@@ -180,16 +153,14 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 				continue
 			}
 
-
 			_, err = conn.Write(requestToSend)
 			if err != nil {
 				log.Printf("Ошибка отправки запроса на %s: %v", serverAddr, err)
 				continue
 			}
 
-			// Читаем ответ
 			buf := make([]byte, 512)
-			conn.SetReadDeadline(time.Now().Add(3 * time.Second)) // Дополнительный таймаут на чтение
+			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 			n, err := conn.Read(buf)
 			if err != nil {
 				log.Printf("Ошибка чтения ответа от %s: %v", serverAddr, err)
@@ -197,7 +168,6 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 			}
 			responseBytes = buf[:n]
 
-			// Парсим ответ с помощью dnsmessage.Message.Unpack
 			var msg dnsmessage.Message
 			err = msg.Unpack(responseBytes)
 			if err != nil {
@@ -205,11 +175,7 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 				continue
 			}
 
-			// Проверяем, получен ли окончательный ответ (флаг RA - Recursion Available)
-			// Или если это авторитетный ответ (AA - Authoritative Answer) и есть ответы
-			// Или если это CNAME, и мы можем его обработать
 			if msg.Header.RecursionAvailable || (msg.Header.Authoritative && len(msg.Answers) > 0) {
-				// Если это финальный ответ, возвращаем его
 				if msg.Header.ID != originalID {
 					log.Printf("ID ответа (%d) не совпадает с ID запроса (%d) от %s. Пропускаем.", msg.Header.ID, originalID, serverAddr)
 					continue
@@ -218,20 +184,18 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 				return responseBytes, nil
 			}
 
-			// Если ответ не окончательный, ищем NS-записи в секции "Authority"
-			// и соответствующие A/AAAA записи в секции "Additional"
-			
-			// Собираем NS-записи и их IP-адреса
+			// Ищем NS-записи в секции Authority и соответствующие A/AAAA записи в Additional
 			for _, auth := range msg.Authorities {
 				if auth.Header.Type == dnsmessage.TypeNS {
 					nsName := auth.Body.(*dnsmessage.NSResource).NS.String()
-					// Ищем IP-адрес для этого NS-сервера в разделе Additional
 					for _, add := range msg.Additionals {
 						if add.Header.Name.String() == nsName {
 							if add.Header.Type == dnsmessage.TypeA {
-								nextServers = append(nextServers, fmt.Sprintf("%s:%d", add.Body.(*dnsmessage.AResource).A.String(), 53))
+								// Исправлено: net.IP(add.Body.(*dnsmessage.AResource).A).String()
+								nextServers = append(nextServers, fmt.Sprintf("%s:%d", net.IP(add.Body.(*dnsmessage.AResource).A).String(), 53))
 							} else if add.Header.Type == dnsmessage.TypeAAAA {
-								nextServers = append(nextServers, fmt.Sprintf("%s:%d", add.Body.(*dnsmessage.AAAAResource).AAAA.String(), 53))
+								// Исправлено: net.IP(add.Body.(*dnsmessage.AAAAResource).AAAA).String()
+								nextServers = append(nextServers, fmt.Sprintf("%s:%d", net.IP(add.Body.(*dnsmessage.AAAAResource).AAAA).String(), 53))
 							}
 						}
 					}
@@ -240,24 +204,18 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 
 			if len(nextServers) > 0 {
 				log.Printf("Найдены %d новых серверов для %s: %v", len(nextServers), question.Name.String(), nextServers)
-				currentServers = nextServers // Обновляем список серверов для следующей попытки
-				goto nextAttempt // Переходим к следующей попытке с новыми серверами
+				currentServers = nextServers
+				goto nextAttempt
 			} else {
-				// Если NS-записи не найдены или нет IP для них, это может быть тупик.
-				// Пробуем следующий сервер из текущего списка.
 				log.Printf("Не удалось найти NS-записи или их IP для %s от %s. Пробуем следующий сервер в текущем списке.", question.Name.String(), serverAddr)
 			}
 		}
-		// Если дошли сюда, значит, все серверы в currentServers были испробованы
-		// без нахождения новых серверов для продолжения или окончательного ответа.
-		// Если nextServers пуст, то это тупик.
 		if len(nextServers) == 0 {
-			break // Выходим из цикла попыток
+			break
 		}
-		currentServers = nextServers // Обновляем currentServers для следующей итерации
-		nextAttempt: // Метка для goto
+		currentServers = nextServers
+		nextAttempt:
 	}
 
-	// Если дошли до сюда, значит, не смогли разрешить
 	return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток", question.Name.String())
 }
