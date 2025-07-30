@@ -379,6 +379,7 @@ func (r *Resolver) resolveCNAMEs(ctx context.Context, msg *dns.Msg, originalID u
 	// Создаем новый ответ, чтобы добавлять в него записи
 	finalMsg := new(dns.Msg)
 	finalMsg.SetReply(msg) // Копируем заголовок и вопросы
+	finalMsg.RecursionAvailable = true // <--- ДОБАВЛЕНО: Устанавливаем флаг RA
 
 	// Добавляем все существующие ответы
 	finalMsg.Answer = append(finalMsg.Answer, msg.Answer...)
