@@ -132,7 +132,8 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 	return packedResponse, nil
 }
 
-// recursiveResolve выполняет рекурсивный запрос к DNS-серверам
+// recursiveResolve выполняет рекурсивный запрос к DNS-серверам.
+// Теперь он отправляет запросы к нескольким серверам параллельно и ждет первый успешный ответ.
 func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, originalID uint16, currentServers []string, depth int) (*dns.Msg, error) {
 	log.Printf("Debug: recursiveResolve: Начинаем рекурсию для %s (Тип: %s, ID: %d, Глубина: %d)", question.Name, dns.Type(question.Qtype).String(), originalID, depth)
 
@@ -153,6 +154,12 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 
 	var lastError error
 
+	// Канал для получения успешных ответов
+	responseChan := make(chan *dns.Msg, len(serversToQuery))
+	// Канал для получения ошибок
+	errorChan := make(chan error, len(serversToQuery))
+
+	// Отправляем запросы ко всем серверам параллельно
 	for _, serverAddr := range serversToQuery {
 		select {
 		case <-ctx.Done():
@@ -161,127 +168,140 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 			// Продолжаем
 		}
 
-		log.Printf("Debug: recursiveResolve: Попытка запроса к %s для %s", serverAddr, question.Name)
+		go func(addr string) {
+			log.Printf("Debug: recursiveResolve: Отправка запроса к %s для %s в горутине.", addr, question.Name)
+			client := new(dns.Client)
+			client.Net = "udp"
+			client.Timeout = 2 * time.Second // Таймаут для каждого отдельного запроса
 
-		// Создаем DNS-клиент с таймаутом
-		client := new(dns.Client)
-		client.Net = "udp" // Начинаем с UDP
-		// Таймаут для обмена сообщений. Можно сделать его динамическим,
-		// но для простоты пока фиксированный.
-		client.Timeout = 2 * time.Second
+			reqMsg := new(dns.Msg)
+			reqMsg.SetQuestion(question.Name, question.Qtype)
+			reqMsg.Id = originalID
+			reqMsg.RecursionDesired = true
 
-		reqMsg := new(dns.Msg)
-		reqMsg.SetQuestion(question.Name, question.Qtype)
-		reqMsg.Id = originalID
-		reqMsg.RecursionDesired = true // Просим рекурсию, но сами ее выполняем
-
-		// Отправляем запрос
-		respMsg, rtt, err := client.ExchangeContext(ctx, reqMsg, serverAddr)
-		if err != nil {
-			log.Printf("Error: Ошибка обмена DNS с %s: %v (RTT: %s)", serverAddr, err, rtt)
-			lastError = err
-			continue
-		}
-
-		// Проверяем, совпадает ли ID запроса/ответа
-		if respMsg.Id != originalID {
-			log.Printf("Warning: ID ответа (%d) от %s не совпадает с ID запроса (%d). Пропускаем.", respMsg.Id, serverAddr, originalID)
-			continue
-		}
-
-		// --- Обработка усеченных ответов (Truncated) ---
-		if respMsg.Truncated && client.Net == "udp" {
-			log.Printf("Debug: Ответ от %s усечен. Попытка повторной отправки по TCP.", serverAddr)
-			client.Net = "tcp"
-			respMsg, rtt, err = client.ExchangeContext(ctx, reqMsg, serverAddr)
+			respMsg, rtt, err := client.ExchangeContext(ctx, reqMsg, addr)
 			if err != nil {
-				log.Printf("Error: Ошибка обмена DNS по TCP с %s после усечения: %v (RTT: %s)", serverAddr, err, rtt)
-				lastError = err
-				continue
+				log.Printf("Error: Ошибка обмена DNS с %s: %v (RTT: %s)", addr, err, rtt)
+				errorChan <- err
+				return
 			}
-			if respMsg.Truncated { // Если и по TCP усечен, это проблема
-				log.Printf("Warning: Ответ от %s усечен даже по TCP. Пропускаем.", serverAddr)
-				lastError = errors.New("ответ усечен даже по TCP")
-				continue
+
+			if respMsg.Id != originalID {
+				log.Printf("Warning: ID ответа (%d) от %s не совпадает с ID запроса (%d). Пропускаем.", respMsg.Id, addr, originalID)
+				errorChan <- fmt.Errorf("ID ответа не совпадает")
+				return
 			}
-		}
 
-		// --- Проверяем Rcode ---
-		if respMsg.Rcode != dns.RcodeSuccess {
-			if respMsg.Rcode == dns.RcodeNameError { // NXDOMAIN
-				log.Printf("Debug: Получен NXDOMAIN для %s от %s", question.Name, serverAddr)
-				return respMsg, errors.New("NXDOMAIN") // Возвращаем ошибку NXDOMAIN
+			// Обработка усеченных ответов (Truncated)
+			if respMsg.Truncated && client.Net == "udp" {
+				log.Printf("Debug: Ответ от %s усечен. Попытка повторной отправки по TCP.", addr)
+				client.Net = "tcp"
+				respMsg, rtt, err = client.ExchangeContext(ctx, reqMsg, addr)
+				if err != nil {
+					log.Printf("Error: Ошибка обмена DNS по TCP с %s после усечения: %v (RTT: %s)", addr, err, rtt)
+					errorChan <- err
+					return
+				}
+				if respMsg.Truncated {
+					log.Printf("Warning: Ответ от %s усечен даже по TCP. Пропускаем.", addr)
+					errorChan <- errors.New("ответ усечен даже по TCP")
+					return
+				}
 			}
-			log.Printf("Warning: Получен Rcode %s для %s от %s. Пропускаем.", dns.RcodeToString[respMsg.Rcode], question.Name, serverAddr)
-			lastError = fmt.Errorf("DNS Rcode: %s", dns.RcodeToString[respMsg.Rcode])
-			continue
-		}
 
-		// --- Проверяем секцию "Answer" ---
-		if len(respMsg.Answer) > 0 {
-			// Если есть ответы, это окончательный ответ.
-			// Нужно обработать CNAME, если он присутствует.
-			log.Printf("Debug: Получен окончательный ответ для %s от %s. Обработка CNAME.", question.Name, serverAddr)
-			finalResp, err := r.resolveCNAMEs(ctx, respMsg, originalID, depth+1)
-			if err != nil {
-				return nil, err
+			if respMsg.Rcode != dns.RcodeSuccess {
+				if respMsg.Rcode == dns.RcodeNameError {
+					log.Printf("Debug: Получен NXDOMAIN для %s от %s", question.Name, addr)
+					errorChan <- errors.New("NXDOMAIN")
+					return
+				}
+				log.Printf("Warning: Получен Rcode %s для %s от %s. Пропускаем.", dns.RcodeToString[respMsg.Rcode], question.Name, addr)
+				errorChan <- fmt.Errorf("DNS Rcode: %s", dns.RcodeToString[respMsg.Rcode])
+				return
 			}
-			return finalResp, nil
-		}
 
-		// --- Если нет ответов, ищем NS-записи в секции "Authority" для продолжения рекурсии ---
-		var nextServers []string
-		foundReferral := false
+			responseChan <- respMsg // Отправляем успешный ответ в канал
+		}(serverAddr)
+	}
 
-		for _, rr := range respMsg.Ns {
-			if ns, ok := rr.(*dns.NS); ok {
-				nsName := ns.Ns
-				log.Printf("Debug: Найден NS-сервер (Authority): %s", nsName)
-				foundReferral = true
+	// Ждем первый успешный ответ или все ошибки
+	responsesReceived := 0
+	errorsReceived := 0
+	totalServers := len(serversToQuery)
 
-				// Ищем IP-адрес для этого NS-сервера в секции Additional
-				foundIPForNS := false
-				for _, extraRR := range respMsg.Extra {
-					if extraRR.Header().Name == nsName {
-						if a, ok := extraRR.(*dns.A); ok {
-							nextServers = append(nextServers, net.JoinHostPort(a.A.String(), "53"))
-							foundIPForNS = true
-							log.Printf("Debug: Найден A-запись для NS %s: %s", nsName, a.A.String())
-						} else if aaaa, ok := extraRR.(*dns.AAAA); ok {
-							nextServers = append(nextServers, net.JoinHostPort(aaaa.AAAA.String(), "53"))
-							foundIPForNS = true
-							log.Printf("Debug: Найден AAAA-запись для NS %s: %s", nsName, aaaa.AAAA.String())
+	for responsesReceived < totalServers || errorsReceived < totalServers {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err() // Общий таймаут или отмена контекста
+		case respMsg := <-responseChan:
+			responsesReceived++
+			// Если есть ответы, это окончательный ответ или делегирование
+			if len(respMsg.Answer) > 0 {
+				log.Printf("Debug: Получен окончательный ответ для %s от одного из серверов. Обработка CNAME.", question.Name)
+				finalResp, err := r.resolveCNAMEs(ctx, respMsg, originalID, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				return finalResp, nil
+			}
+
+			// Если нет ответов, ищем NS-записи для продолжения рекурсии
+			var nextServers []string
+			foundReferral := false
+
+			for _, rr := range respMsg.Ns {
+				if ns, ok := rr.(*dns.NS); ok {
+					nsName := ns.Ns
+					log.Printf("Debug: Найден NS-сервер (Authority): %s", nsName)
+					foundReferral = true
+
+					foundIPForNS := false
+					for _, extraRR := range respMsg.Extra {
+						if extraRR.Header().Name == nsName {
+							if a, ok := extraRR.(*dns.A); ok {
+								nextServers = append(nextServers, net.JoinHostPort(a.A.String(), "53"))
+								foundIPForNS = true
+								log.Printf("Debug: Найден A-запись для NS %s: %s", nsName, a.A.String())
+							} else if aaaa, ok := extraRR.(*dns.AAAA); ok {
+								nextServers = append(nextServers, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+								foundIPForNS = true
+								log.Printf("Debug: Найден AAAA-запись для NS %s: %s", nsName, aaaa.AAAA.String())
+							}
+						}
+					}
+
+					if !foundIPForNS {
+						log.Printf("Debug: IP для NS %s не найден в Additional-секции. Попытка рекурсивного разрешения NS-имени.", nsName)
+						nsIPs, err := r.resolveNSIP(ctx, nsName, originalID, rootServers, depth+1)
+						if err != nil {
+							log.Printf("Error: Не удалось разрешить IP для NS %s: %v", nsName, err)
+						} else {
+							for _, ip := range nsIPs {
+								nextServers = append(nextServers, net.JoinHostPort(ip, "53"))
+								log.Printf("Debug: Разрешен IP для NS %s: %s", nsName, ip)
+							}
 						}
 					}
 				}
-
-				// Если IP не найден в Additional (glue record), рекурсивно разрешаем NS-имя
-				if !foundIPForNS {
-					log.Printf("Debug: IP для NS %s не найден в Additional-секции. Попытка рекурсивного разрешения NS-имени.", nsName)
-					nsIPs, err := r.resolveNSIP(ctx, nsName, originalID, rootServers, depth+1) // Начинаем с корня для разрешения NS
-					if err != nil {
-						log.Printf("Error: Не удалось разрешить IP для NS %s: %v", nsName, err)
-					} else {
-						for _, ip := range nsIPs {
-							nextServers = append(nextServers, net.JoinHostPort(ip, "53"))
-							log.Printf("Debug: Разрешен IP для NS %s: %s", nsName, ip)
-						}
-					}
-				}
 			}
-		}
 
-		if foundReferral && len(nextServers) > 0 {
-			// Если нашли делегирование и IP-адреса для новых серверов, продолжаем рекурсию
-			log.Printf("Debug: Найдены %d потенциальных новых серверов для %s: %v. Продолжаем рекурсию.", len(nextServers), question.Name, nextServers)
-			return r.recursiveResolve(ctx, question, originalID, nextServers, depth+1)
-		} else if foundReferral && len(nextServers) == 0 {
-			// Нашли NS-записи, но не смогли получить их IP.
-			log.Printf("Warning: Найдены NS-записи, но не удалось найти IP-адреса для них. Пробуем следующий сервер в текущем списке.")
+			if foundReferral && len(nextServers) > 0 {
+				log.Printf("Debug: Найдены %d потенциальных новых серверов для %s: %v. Продолжаем рекурсию.", len(nextServers), question.Name, nextServers)
+				return r.recursiveResolve(ctx, question, originalID, nextServers, depth+1)
+			} else if foundReferral && len(nextServers) == 0 {
+				log.Printf("Warning: Найдены NS-записи, но не удалось найти IP-адреса для них. Ждем другие ответы/ошибки.")
+			}
+		case err := <-errorChan:
+			errorsReceived++
+			lastError = err // Сохраняем последнюю ошибку
+			if errorsReceived == totalServers {
+				// Если все запросы завершились ошибкой, возвращаем последнюю ошибку
+				return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
+			}
 		}
 	}
 
-	// Если мы прошли по всем текущим серверам и не смогли разрешить домен
+	// Если дошли сюда, значит, все запросы завершились, но не было найдено окончательного ответа
 	if lastError != nil {
 		return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
 	}
