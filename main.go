@@ -9,8 +9,9 @@ import (
 	"os"
 	"time"
 
-	"astracat-dns/resolver" // Убедитесь, что путь к пакету правильный
-	"github.com/miekg/dns"   // Используем miekg/dns
+	// ИСПРАВЛЕННЫЙ ПУТЬ ИМПОРТА
+	"github.com/ASTRACAT2022/The-ASTRACAT-DNS-Resolver/resolver" 
+	"github.com/miekg/dns" // Используем miekg/dns
 )
 
 const (
