@@ -191,11 +191,11 @@ func (r *Resolver) recursiveResolve(originalRequest []byte, question dnsmessage.
 					for _, add := range msg.Additionals {
 						if add.Header.Name.String() == nsName {
 							if add.Header.Type == dnsmessage.TypeA {
-								// Исправлено: net.IP(add.Body.(*dnsmessage.AResource).A).String()
-								nextServers = append(nextServers, fmt.Sprintf("%s:%d", net.IP(add.Body.(*dnsmessage.AResource).A).String(), 53))
+								// Исправлено: net.IP(add.Body.(*dnsmessage.AResource).A[:]).String()
+								nextServers = append(nextServers, fmt.Sprintf("%s:%d", net.IP(add.Body.(*dnsmessage.AResource).A[:]).String(), 53))
 							} else if add.Header.Type == dnsmessage.TypeAAAA {
-								// Исправлено: net.IP(add.Body.(*dnsmessage.AAAAResource).AAAA).String()
-								nextServers = append(nextServers, fmt.Sprintf("%s:%d", net.IP(add.Body.(*dnsmessage.AAAAResource).AAAA).String(), 53))
+								// Исправлено: net.IP(add.Body.(*dnsmessage.AAAAResource).AAAA[:]).String()
+								nextServers = append(nextServers, fmt.Sprintf("%s:%d", net.IP(add.Body.(*dnsmessage.AAAAResource).AAAA[:]).String(), 53))
 							}
 						}
 					}
