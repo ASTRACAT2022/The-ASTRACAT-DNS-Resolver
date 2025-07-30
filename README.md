@@ -26,11 +26,11 @@ ASTRACAT DNS Resolver - это рекурсивный DNS-резолвер, на
     Откройте терминал и клонируйте репозиторий (предполагая, что он будет на GitHub):
 
     ```bash
-    git clone https://github.com/ВАШ_ПОЛЬЗОВАТЕЛЬ/The-ASTRACAT-DNS-Resolver.git
+    git clone https://github.com/ASTRACAT2022/The-ASTRACAT-DNS-Resolver.git
     cd The-ASTRACAT-DNS-Resolver
     ```
 
-    (Замените `ВАШ_ПОЛЬЗОВАТЕЛЬ` на ваше имя пользователя GitHub, когда будете выкладывать репозиторий).
+    
 
 2.  **Установите зависимости:**
     Проект использует библиотеку `miekg/dns`. Установите ее:
