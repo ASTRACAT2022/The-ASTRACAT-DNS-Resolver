@@ -1,4 +1,4 @@
-
+Creater * **Telegram-канал:** [ASTRACAT UI](https://t.me/astracatui)  ([@astracatui](https://t.me/astracatui))
 # ASTRACAT DNS Resolver
 
 ASTRACAT DNS Resolver - это рекурсивный DNS-резолвер, написанный на Go. Он предназначен для выполнения рекурсивных запросов DNS, начиная с корневых серверов, и разрешения доменных имен без использования внешних DNS-серверов (таких как Google Public DNS или Cloudflare DNS) для выполнения рекурсии.
