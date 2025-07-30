@@ -1,14 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"io" // Добавляем для io.Discard
+	"io"
 	"log"
 	"net"
-	// "runtime/debug" // Удален, так как не используется
+	"os"
+	"time"
 
-	"astracat-dns/resolver"
-	"golang.org/x/net/dns/dnsmessage"
+	"astracat-dns/resolver" // Убедитесь, что путь к пакету правильный
+	"github.com/miekg/dns"   // Используем miekg/dns
 )
 
 const (
@@ -16,14 +18,12 @@ const (
 )
 
 func main() {
-	// *** ВАЖНО: Это должно быть одной из ПЕРВЫХ операций в main. ***
-	// Устанавливаем вывод логов в "никуда", чтобы они не отображались.
-	log.SetOutput(io.Discard)
-
-	// Эти настройки (флаги и префикс) теперь не будут иметь видимого эффекта,
-	// так как вывод логов отключен, но их можно оставить для легкого включения логирования обратно.
+	// --- Настройка логирования ---
+	// Для отладки раскомментируйте следующую строку:
+	// log.SetOutput(os.Stdout)
+	log.SetOutput(io.Discard) // Отключаем логирование по умолчанию для "чистоты"
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetPrefix("[DNS_RESOLVER] ")
+	log.SetPrefix("[ASTRACAT_DNS_RESOLVER] ")
 
 	// Инициализируем наш резолвер
 	dnsResolver := resolver.NewResolver()
@@ -31,26 +31,23 @@ func main() {
 	// Создаем UDP-сервер
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		// log.Fatalf остается, так как это критическая ошибка запуска,
-		// которая должна быть видна, даже если остальные логи отключены.
-		log.Fatalf("Ошибка разрешения UDP-адреса: %v", err)
+		log.Fatalf("Fatal: Ошибка разрешения UDP-адреса: %v", err)
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		log.Fatalf("Ошибка при прослушивании UDP: %v", err)
+		log.Fatalf("Fatal: Ошибка при прослушивании UDP: %v", err)
 	}
 	defer conn.Close()
 
-	// Это сообщение также не будет выведено, так как логирование отключено.
-	// log.Printf("The ASTRACAT DNS Resolver запущен на :%d", port)
+	fmt.Printf("The ASTRACAT DNS Resolver запущен на UDP :%d\n", port) // Всегда выводим в консоль
 
 	// Основной цикл обработки запросов
 	for {
 		buf := make([]byte, 512) // Максимальный размер UDP DNS-пакета
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			// log.Printf("ERROR: Ошибка чтения из UDP: %v", err)
+			log.Printf("Error: Ошибка чтения из UDP: %v", err)
 			continue
 		}
 
@@ -63,77 +60,68 @@ func main() {
 func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte, r *resolver.Resolver) {
 	// Отлов паник, чтобы приложение не падало полностью
 	defer func() {
-		if r := recover(); r != nil {
-			// Если вы хотите видеть паники, даже когда логи отключены,
-			// можно использовать fmt.Printf здесь, но это не будет логироваться
-			// через стандартный log пакет.
-			// fmt.Printf("CRITICAL PANIC in handleDNSRequest for client %s: %v\n", clientAddr.String(), r)
-			// debug.PrintStack() // Если хотите стек-трейс, нужно импортировать "runtime/debug" обратно
-
-			// В случае паники отправляем клиенту SERVFAIL
-			errorResponse := buildErrorDNSResponse(request, dnsmessage.RCodeServerFailure)
+		if rec := recover(); rec != nil {
+			log.Printf("Critical Panic in handleDNSRequest for client %s: %v", clientAddr.String(), rec)
+			// Отправляем SERVFAIL, чтобы клиент знал, что что-то пошло не так
+			errorResponse := buildErrorDNSResponse(request, dns.RcodeServerFailure)
 			_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
 			if writeErr != nil {
-				// log.Printf("ERROR: Ошибка отправки ошибки клиенту после паники %s: %v", clientAddr.String(), writeErr)
+				log.Printf("Error: Ошибка отправки ошибки клиенту после паники %s: %v", clientAddr.String(), writeErr)
 			}
 		}
 	}()
 
-	// log.Printf("DEBUG: Получен запрос от %s: %d байт. Начинаем обработку.", clientAddr.String(), len(request))
+	log.Printf("Debug: Получен запрос от %s: %d байт. Начинаем обработку.", clientAddr.String(), len(request))
 
-	response, err := r.Resolve(request)
+	// Создаем контекст для запроса с таймаутом
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Общий таймаут на разрешение
+	defer cancel()
+
+	response, err := r.Resolve(ctx, request)
 	if err != nil {
-		// log.Printf("ERROR: Ошибка резолвинга запроса от %s: %v", clientAddr.String(), err)
+		log.Printf("Error: Ошибка резолвинга запроса от %s: %v", clientAddr.String(), err)
 		// Отправка DNS-ответа с ошибкой
-		errorResponse := buildErrorDNSResponse(request, dnsmessage.RCodeServerFailure)
+		rcode := dns.RcodeServerFailure
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			rcode = dns.RcodeServerFailure // Или dns.RcodeRefused, если хотите
+		} else if err.Error() == "NXDOMAIN" { // Пример для NXDOMAIN
+			rcode = dns.RcodeNameError
+		}
+		errorResponse := buildErrorDNSResponse(request, rcode)
 		_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
 		if writeErr != nil {
-			// log.Printf("ERROR: Ошибка отправки ошибки клиенту %s: %v", clientAddr.String(), writeErr)
+			log.Printf("Error: Ошибка отправки ошибки клиенту %s: %v", clientAddr.String(), writeErr)
 		}
 		return
 	}
 
-	// log.Printf("DEBUG: Запрос от %s успешно разрешен. Отправляем ответ.", clientAddr.String())
+	log.Printf("Debug: Запрос от %s успешно разрешен. Отправляем ответ.", clientAddr.String())
 	_, err = conn.WriteToUDP(response, clientAddr)
 	if err != nil {
-		// log.Printf("ERROR: Ошибка отправки ответа клиенту %s: %v", clientAddr.String(), err)
+		log.Printf("Error: Ошибка отправки ответа клиенту %s: %v", clientAddr.String(), err)
 	} else {
-		// log.Printf("DEBUG: Ответ успешно отправлен клиенту %s", clientAddr.String())
+		log.Printf("Debug: Ответ успешно отправлен клиенту %s", clientAddr.String())
 	}
 }
 
 // buildErrorDNSResponse создает DNS-ответ с указанным кодом ошибки (RCode).
-func buildErrorDNSResponse(originalRequest []byte, rcode dnsmessage.RCode) []byte {
-	var originalMsg dnsmessage.Message
-	// Попытаемся распаковать оригинальный запрос, чтобы скопировать ID и вопросы.
-	// Если не получится, используем дефолтные значения.
-	if err := originalMsg.Unpack(originalRequest); err != nil {
-		// log.Printf("DEBUG: Не удалось распаковать оригинальный запрос для формирования ошибки: %v", err)
+func buildErrorDNSResponse(originalRequest []byte, rcode int) []byte {
+	msg := new(dns.Msg)
+	err := msg.Unpack(originalRequest)
+	if err != nil {
 		// Если запрос невалидный, создадим минимальный ответ с ошибкой
-		resp := dnsmessage.Message{
-			Header: dnsmessage.Header{
-				ID:       0, // Или случайный ID, если originalMsg.Header.ID невалиден
-				Response: true,
-				RCode:    rcode,
-			},
-		}
-		packed, _ := resp.Pack() // Игнорируем ошибку упаковки для простоты
+		resp := new(dns.Msg)
+		resp.SetRcode(msg, rcode)
+		packed, _ := resp.Pack()
 		return packed
 	}
 
-	resp := dnsmessage.Message{
-		Header: dnsmessage.Header{
-			ID:                 originalMsg.Header.ID,
-			Response:           true,
-			RecursionDesired:   originalMsg.Header.RecursionDesired,
-			RecursionAvailable: true, // Мы рекурсивный резолвер
-			RCode:              rcode,
-		},
-		Questions: originalMsg.Questions, // Копируем оригинальные вопросы
-	}
+	resp := new(dns.Msg)
+	resp.SetRcode(msg, rcode)
+	resp.RecursionAvailable = true // Мы рекурсивный резолвер
 	packed, err := resp.Pack()
 	if err != nil {
-		// log.Printf("ERROR: Ошибка упаковки DNS-ответа с ошибкой: %v", err)
+		log.Printf("Error: Ошибка упаковки DNS-ответа с ошибкой: %v", err)
 		return []byte{} // Возвращаем пустые байты в случае критической ошибки
 	}
 	return packed
