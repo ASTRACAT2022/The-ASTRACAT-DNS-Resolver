@@ -13,7 +13,7 @@ type CacheEntry struct {
 
 // Cache представляет DNS-кэш
 type Cache struct {
-	mu    sync.RWMutex // Мьютекс для безопасного доступа к карте
+	mu      sync.RWMutex // Мьютекс для безопасного доступа к карте
 	entries map[string]CacheEntry
 }
 
@@ -38,7 +38,7 @@ func (c *Cache) Get(key string) ([]byte, bool) {
 	}
 	if time.Now().After(entry.ExpiresAt) {
 		// Запись устарела, удаляем ее
-		delete(c.entries, key)
+		delete(c.entries, key) // Удаляем устаревшую запись
 		return nil, false
 	}
 	return entry.Response, true
