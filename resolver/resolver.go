@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"sync" // Добавляем пакет sync для WaitGroup
 	"time"
 
 	"github.com/miekg/dns" // Используем miekg/dns
@@ -154,6 +155,13 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 
 	var lastError error
 
+	// Создаем дочерний контекст для всех параллельных запросов
+	// Он будет отменен, как только один из запросов завершится успешно
+	parallelCtx, cancelParallel := context.WithCancel(ctx)
+	defer cancelParallel() // Убедимся, что контекст отменен при выходе из функции
+
+	// WaitGroup для отслеживания завершения всех горутин
+	var wg sync.WaitGroup
 	// Канал для получения успешных ответов
 	responseChan := make(chan *dns.Msg, len(serversToQuery))
 	// Канал для получения ошибок
@@ -161,14 +169,19 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 
 	// Отправляем запросы ко всем серверам параллельно
 	for _, serverAddr := range serversToQuery {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err() // Контекст отменен или истек таймаут
-		default:
-			// Продолжаем
-		}
-
+		wg.Add(1) // Увеличиваем счетчик WaitGroup для каждой горутины
 		go func(addr string) {
+			defer wg.Done() // Уменьшаем счетчик WaitGroup при завершении горутины
+
+			select {
+			case <-parallelCtx.Done():
+				// Если контекст уже отменен, не отправляем запрос
+				log.Printf("Debug: Запрос к %s для %s отменен до отправки.", addr, question.Name)
+				return
+			default:
+				// Продолжаем
+			}
+
 			log.Printf("Debug: recursiveResolve: Отправка запроса к %s для %s в горутине.", addr, question.Name)
 			client := new(dns.Client)
 			client.Net = "udp"
@@ -179,7 +192,7 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 			reqMsg.Id = originalID
 			reqMsg.RecursionDesired = true
 
-			respMsg, rtt, err := client.ExchangeContext(ctx, reqMsg, addr)
+			respMsg, rtt, err := client.ExchangeContext(parallelCtx, reqMsg, addr) // Используем parallelCtx
 			if err != nil {
 				log.Printf("Error: Ошибка обмена DNS с %s: %v (RTT: %s)", addr, err, rtt)
 				errorChan <- err
@@ -196,7 +209,7 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 			if respMsg.Truncated && client.Net == "udp" {
 				log.Printf("Debug: Ответ от %s усечен. Попытка повторной отправки по TCP.", addr)
 				client.Net = "tcp"
-				respMsg, rtt, err = client.ExchangeContext(ctx, reqMsg, addr)
+				respMsg, rtt, err = client.ExchangeContext(parallelCtx, reqMsg, addr) // Используем parallelCtx
 				if err != nil {
 					log.Printf("Error: Ошибка обмена DNS по TCP с %s после усечения: %v (RTT: %s)", addr, err, rtt)
 					errorChan <- err
@@ -224,20 +237,30 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 		}(serverAddr)
 	}
 
-	// Ждем первый успешный ответ или все ошибки
-	responsesReceived := 0
-	errorsReceived := 0
-	totalServers := len(serversToQuery)
+	// Горутина для закрытия каналов после завершения всех запросов
+	go func() {
+		wg.Wait() // Ждем завершения всех горутин
+		close(responseChan)
+		close(errorChan)
+	}()
 
-	for responsesReceived < totalServers || errorsReceived < totalServers {
+	// Ждем первый успешный ответ или все ошибки
+	for {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err() // Общий таймаут или отмена контекста
-		case respMsg := <-responseChan:
-			responsesReceived++
+		case <-ctx.Done(): // Общий таймаут или отмена контекста
+			return nil, ctx.Err()
+		case respMsg, ok := <-responseChan:
+			if !ok { // Канал закрыт, и ответов больше нет
+				if lastError != nil {
+					return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
+				}
+				return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток (нет ответа)", question.Name)
+			}
+
 			// Если есть ответы, это окончательный ответ или делегирование
 			if len(respMsg.Answer) > 0 {
 				log.Printf("Debug: Получен окончательный ответ для %s от одного из серверов. Обработка CNAME.", question.Name)
+				cancelParallel() // Отменяем все остальные параллельные запросы
 				finalResp, err := r.resolveCNAMEs(ctx, respMsg, originalID, depth+1)
 				if err != nil {
 					return nil, err
@@ -287,25 +310,21 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 
 			if foundReferral && len(nextServers) > 0 {
 				log.Printf("Debug: Найдены %d потенциальных новых серверов для %s: %v. Продолжаем рекурсию.", len(nextServers), question.Name, nextServers)
+				cancelParallel() // Отменяем все остальные параллельные запросы
 				return r.recursiveResolve(ctx, question, originalID, nextServers, depth+1)
 			} else if foundReferral && len(nextServers) == 0 {
 				log.Printf("Warning: Найдены NS-записи, но не удалось найти IP-адреса для них. Ждем другие ответы/ошибки.")
 			}
-		case err := <-errorChan:
-			errorsReceived++
-			lastError = err // Сохраняем последнюю ошибку
-			if errorsReceived == totalServers {
-				// Если все запросы завершились ошибкой, возвращаем последнюю ошибку
-				return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
+		case err, ok := <-errorChan:
+			if !ok { // Канал закрыт, и ошибок больше нет
+				if lastError != nil {
+					return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
+				}
+				return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток (нет ответа)", question.Name)
 			}
+			lastError = err // Сохраняем последнюю ошибку
 		}
 	}
-
-	// Если дошли сюда, значит, все запросы завершились, но не было найдено окончательного ответа
-	if lastError != nil {
-		return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
-	}
-	return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток (нет ответа)", question.Name)
 }
 
 // resolveNSIP рекурсивно разрешает IP-адрес для NS-имени.
