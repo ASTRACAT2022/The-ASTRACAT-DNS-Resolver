@@ -56,7 +56,16 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 		err := cachedMsg.Unpack(cachedResponse)
 		if err != nil {
 			log.Printf("Error: Ошибка распаковки кэшированного ответа: %v. Попытка рекурсивного разрешения.", err)
-			return r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0) // Начинаем с корня
+			// ИСПРАВЛЕНИЕ: Упаковываем ответ recursiveResolve перед возвратом
+			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			packedResp, packErr := respMsg.Pack()
+			if packErr != nil {
+				return nil, fmt.Errorf("ошибка упаковки рекурсивного ответа: %w", packErr)
+			}
+			return packedResp, nil
 		}
 
 		cachedMsg.Id = msg.Id                 // Устанавливаем ID из оригинального запроса
@@ -67,7 +76,16 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 		finalResponse, err := cachedMsg.Pack()
 		if err != nil {
 			log.Printf("Error: Ошибка пересборки кэшированного ответа: %v. Попытка рекурсивного разрешения.", err)
-			return r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0) // Начинаем с корня
+			// ИСПРАВЛЕНИЕ: Упаковываем ответ recursiveResolve перед возвратом
+			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			packedResp, packErr := respMsg.Pack()
+			if packErr != nil {
+				return nil, fmt.Errorf("ошибка упаковки рекурсивного ответа: %w", packErr)
+			}
+			return packedResp, nil
 		}
 		log.Printf("Debug: Возвращаем кэшированный ответ для %s (%s)", queryName, queryType)
 		return finalResponse, nil
