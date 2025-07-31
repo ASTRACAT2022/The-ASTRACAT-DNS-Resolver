@@ -3,78 +3,86 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
-	"sync"
+	"runtime"
+	"syscall"
 	"time"
 
-	"github.com/ASTRACAT2022/The-ASTRACAT-DNS-Resolver/resolver"
+	"The-ASTRACAT-DNS-Resolver/resolver"
 	"github.com/miekg/dns"
 )
 
 const (
-	port = 5353 // Порт для The ASTRACAT DNS Resolver
+	port = 5353
 )
-
-// --- Rate Limiting ---
-const (
-	// Максимальное количество запросов в секунду для одного IP-адреса
-	maxRequestsPerSecond = 10
-	// Период окна для ограничения скорости (например, 1 секунда)
-	rateLimitWindow = 1 * time.Second
-)
-
-// clientRequestCounter хранит количество запросов от каждого IP-адреса
-var clientRequestCounter = make(map[string]int)
-// clientWindowStart хранит время начала текущего окна для каждого IP-адреса
-var clientWindowStart = make(map[string]time.Time)
-var mu sync.Mutex // Мьютекс для защиты доступа к картам rate limiter'а
 
 func main() {
 	// --- Настройка логирования ---
-	log.SetOutput(os.Stdout) // Включаем логирование для отладки
+	log.SetOutput(io.Discard)
+	// log.SetOutput(os.Stdout) // Раскомментируйте эту строку и добавьте "os" в импорты для отладки
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetPrefix("[ASTRACAT_DNS_RESOLVER] ")
+	log.SetPrefix("[ASTRACAT_DNS-RESOLVER] ")
 
-	// Создаем контекст для всего приложения, который будет управлять жизненным циклом, включая предзагрузку
+	// Создаем контекст для всего приложения
 	appCtx, appCancel := context.WithCancel(context.Background())
-	defer appCancel() // Убедимся, что контекст отменен при выходе из main
+	defer appCancel()
 
 	// Инициализируем наш резолвер, передавая контекст
-	dnsResolver := resolver.NewResolver(appCtx) // <--- ИЗМЕНЕНО
+	dnsResolver := resolver.NewResolver(appCtx)
 
-	// Создаем UDP-сервер
+	// Создаем UDP-сервер с опцией SO_REUSEPORT
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			// Эта опция работает только на Linux
+			if runtime.GOOS == "linux" {
+				c.Control(func(fd uintptr) {
+					// Используем числовое значение 15 для SO_REUSEPORT, так как в некоторых средах
+					// константа syscall.SO_REUSEPORT может быть не определена.
+					const SO_REUSEPORT = 15
+					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
+					if err != nil {
+						log.Printf("Warning: Не удалось установить SO_REUSEPORT: %v", err)
+					} else {
+						log.Println("Debug: Опция SO_REUSEPORT успешно установлена.")
+					}
+				})
+			}
+			return err
+		},
+	}
+
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatalf("Fatal: Ошибка разрешения UDP-адреса: %v", err)
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	pc, err := lc.ListenPacket(appCtx, "udp", addr.String())
 	if err != nil {
 		log.Fatalf("Fatal: Ошибка при прослушивании UDP: %v", err)
 	}
-	defer conn.Close()
+	defer pc.Close()
 
+	conn := pc.(*net.UDPConn)
+	
 	fmt.Printf("The ASTRACAT DNS Resolver запущен на UDP :%d\n", port)
 
 	// Основной цикл обработки запросов
 	for {
-		buf := make([]byte, 512) // Максимальный размер UDP DNS-пакета
+		buf := make([]byte, 512)
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("Error: Ошибка чтения из UDP: %v", err)
 			continue
 		}
 
-		// Запускаем обработку запроса в горутине, чтобы не блокировать сервер
 		go handleDNSRequest(conn, clientAddr, buf[:n], dnsResolver)
 	}
 }
 
-// handleDNSRequest обрабатывает каждый входящий DNS-запрос
 func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte, r *resolver.Resolver) {
-	// Отлов паник, чтобы приложение не падало полностью
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("Critical Panic in handleDNSRequest for client %s: %v", clientAddr.String(), rec)
@@ -85,19 +93,6 @@ func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte
 			}
 		}
 	}()
-
-	clientIP := clientAddr.IP.String()
-
-	// --- Rate Limiting Check ---
-	if !allowRequest(clientIP) {
-		log.Printf("Warning: Запрос от %s отклонен из-за превышения лимита скорости.", clientIP)
-		errorResponse := buildErrorDNSResponse(request, dns.RcodeServerFailure) // Или RcodeRefused
-		_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
-		if writeErr != nil {
-			log.Printf("Error: Ошибка отправки ошибки клиенту (rate limit) %s: %v", clientAddr.String(), writeErr)
-		}
-		return
-	}
 
 	log.Printf("Debug: Получен запрос от %s: %d байт. Начинаем обработку.", clientAddr.String(), len(request))
 
@@ -116,7 +111,7 @@ func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte
 		errorResponse := buildErrorDNSResponse(request, rcode)
 		_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
 		if writeErr != nil {
-				log.Printf("Error: Ошибка отправки ошибки клиенту %s: %v", clientAddr.String(), writeErr)
+			log.Printf("Error: Ошибка отправки ошибки клиенту %s: %v", clientAddr.String(), writeErr)
 		}
 		return
 	}
@@ -130,27 +125,6 @@ func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte
 	}
 }
 
-// allowRequest проверяет, разрешен ли запрос от данного IP-адреса согласно лимиту скорости.
-func allowRequest(ip string) bool {
-	mu.Lock()
-	defer mu.Unlock()
-
-	now := time.Now()
-
-	// Если окно для этого IP истекло, сбрасываем счетчик
-	if lastWindowStart, ok := clientWindowStart[ip]; !ok || now.Sub(lastWindowStart) >= rateLimitWindow {
-		clientRequestCounter[ip] = 0
-		clientWindowStart[ip] = now
-	}
-
-	// Увеличиваем счетчик запросов
-	clientRequestCounter[ip]++
-
-	// Проверяем, не превышен ли лимит
-	return clientRequestCounter[ip] <= maxRequestsPerSecond
-}
-
-// buildErrorDNSResponse создает DNS-ответ с указанным кодом ошибки (RCode).
 func buildErrorDNSResponse(originalRequest []byte, rcode int) []byte {
 	msg := new(dns.Msg)
 	err := msg.Unpack(originalRequest)
