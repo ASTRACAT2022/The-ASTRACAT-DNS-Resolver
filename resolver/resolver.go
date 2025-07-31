@@ -7,10 +7,17 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"sync" // Добавляем пакет sync для WaitGroup
+	"sync" // Импортируем пакет sync для WaitGroup
 	"time"
 
 	"github.com/miekg/dns" // Используем miekg/dns
+)
+
+// Prefetching constants
+const (
+	prefetchCheckInterval = 30 * time.Second // Как часто проверять кеш на предмет предзагрузки
+	prefetchThresholdRatio = 0.1             // Предзагружать, если осталось менее 10% от OriginalTTL
+	prefetchQueryTimeout   = 1 * time.Second  // Таймаут для каждого запроса предзагрузки
 )
 
 // Resolver - основной тип для нашего DNS-резолвера
@@ -18,11 +25,13 @@ type Resolver struct {
 	cache *Cache
 }
 
-// NewResolver создает новый экземпляр Resolver
-func NewResolver() *Resolver {
-	return &Resolver{
+// NewResolver создает новый экземпляр Resolver и запускает цикл предзагрузки
+func NewResolver(ctx context.Context) *Resolver {
+	r := &Resolver{
 		cache: NewCache(),
 	}
+	go r.prefetchLoop(ctx) // Запускаем цикл предзагрузки в фоновой горутине
+	return r
 }
 
 // Resolve обрабатывает DNS-запрос и возвращает ответ
@@ -57,11 +66,12 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 		err := cachedMsg.Unpack(cachedResponse)
 		if err != nil {
 			log.Printf("Error: Ошибка распаковки кэшированного ответа: %v. Попытка рекурсивного разрешения.", err)
-			// ИСПРАВЛЕНИЕ: Упаковываем ответ recursiveResolve перед возвратом
-			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0)
+			// Передаем bool-значение для edns0Present
+			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, msg.IsEdns0() != nil, msg.Extra, 0)
 			if resolveErr != nil {
 				return nil, resolveErr
 			}
+			respMsg.RecursionAvailable = true // Устанавливаем флаг RA
 			packedResp, packErr := respMsg.Pack()
 			if packErr != nil {
 				return nil, fmt.Errorf("ошибка упаковки рекурсивного ответа: %w", packErr)
@@ -77,11 +87,12 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 		finalResponse, err := cachedMsg.Pack()
 		if err != nil {
 			log.Printf("Error: Ошибка пересборки кэшированного ответа: %v. Попытка рекурсивного разрешения.", err)
-			// ИСПРАВЛЕНИЕ: Упаковываем ответ recursiveResolve перед возвратом
-			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0)
+			// Передаем bool-значение для edns0Present
+			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, msg.IsEdns0() != nil, msg.Extra, 0)
 			if resolveErr != nil {
 				return nil, resolveErr
 			}
+			respMsg.RecursionAvailable = true // Устанавливаем флаг RA
 			packedResp, packErr := respMsg.Pack()
 			if packErr != nil {
 				return nil, fmt.Errorf("ошибка упаковки рекурсивного ответа: %w", packErr)
@@ -94,7 +105,9 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 
 	// 2. Если нет в кэше, начинаем рекурсивное разрешение
 	log.Printf("Debug: Кэш промахнулся. Начинаем рекурсивное разрешение для %s (%s)", queryName, queryType)
-	responseMsg, err := r.recursiveResolve(ctx, q, msg.Id, rootServers, 0)
+	// Передаем информацию EDNS(0) из входящего запроса
+	// Передаем bool-значение для edns0Present
+	responseMsg, err := r.recursiveResolve(ctx, q, msg.Id, rootServers, msg.IsEdns0() != nil, msg.Extra, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +139,7 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 	}
 
 	if minTTL > 0 { // Кэшируем только если TTL больше 0
-		r.cache.Set(cacheKey, packedResponse, minTTL)
+		r.cache.Set(cacheKey, packedResponse, minTTL, queryName, queryType) // Передаем queryName и queryType
 		log.Printf("Debug: Ответ для %s (%s) закэширован на %d секунд", queryName, queryType, minTTL)
 	}
 
@@ -135,8 +148,9 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 
 // recursiveResolve выполняет рекурсивный запрос к DNS-серверам.
 // Теперь он отправляет запросы к нескольким серверам параллельно и ждет первый успешный ответ.
-func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, originalID uint16, currentServers []string, depth int) (*dns.Msg, error) {
-	log.Printf("Debug: recursiveResolve: Начинаем рекурсию для %s (Тип: %s, ID: %d, Глубина: %d)", question.Name, dns.Type(question.Qtype).String(), originalID, depth)
+// Добавлены параметры edns0Present и incomingExtra для обработки EDNS(0) опций.
+func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, originalID uint16, currentServers []string, edns0Present bool, incomingExtra []dns.RR, depth int) (*dns.Msg, error) {
+	log.Printf("Debug: recursiveResolve: Начинаем рекурсию для %s (Тип: %s, ID: %d, Глубина: %d, EDNS0: %t)", question.Name, dns.Type(question.Qtype).String(), originalID, depth, edns0Present)
 
 	const maxRecursionDepth = 10 // Максимальное количество итераций рекурсии
 	if depth > maxRecursionDepth {
@@ -191,6 +205,19 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 			reqMsg.SetQuestion(question.Name, question.Qtype)
 			reqMsg.Id = originalID
 			reqMsg.RecursionDesired = true
+
+			// --- EDNS(0) ---
+			// Если входящий запрос содержал EDNS(0), добавляем его и к исходящему запросу
+			if edns0Present {
+				reqMsg.SetEdns0(4096, true) // Устанавливаем размер буфера 4096 байт, флаг DO (DNSSEC OK)
+				// Копируем опции EDNS(0) из входящего запроса, если они есть
+				for _, rr := range incomingExtra {
+					if opt, ok := rr.(*dns.OPT); ok {
+						reqMsg.Extra = append(reqMsg.Extra, opt)
+						break // Предполагаем, что OPT-запись одна
+					}
+				}
+			}
 
 			respMsg, rtt, err := client.ExchangeContext(parallelCtx, reqMsg, addr) // Используем parallelCtx
 			if err != nil {
@@ -265,6 +292,7 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 				if err != nil {
 					return nil, err
 				}
+				finalResp.RecursionAvailable = true // Устанавливаем флаг RA
 				return finalResp, nil
 			}
 
@@ -295,7 +323,8 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 
 					if !foundIPForNS {
 						log.Printf("Debug: IP для NS %s не найден в Additional-секции. Попытка рекурсивного разрешения NS-имени.", nsName)
-						nsIPs, err := r.resolveNSIP(ctx, nsName, originalID, rootServers, depth+1)
+						// Передаем edns0Present
+						nsIPs, err := r.resolveNSIP(ctx, nsName, originalID, rootServers, edns0Present, incomingExtra, depth+1)
 						if err != nil {
 							log.Printf("Error: Не удалось разрешить IP для NS %s: %v", nsName, err)
 						} else {
@@ -311,7 +340,8 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 			if foundReferral && len(nextServers) > 0 {
 				log.Printf("Debug: Найдены %d потенциальных новых серверов для %s: %v. Продолжаем рекурсию.", len(nextServers), question.Name, nextServers)
 				cancelParallel() // Отменяем все остальные параллельные запросы
-				return r.recursiveResolve(ctx, question, originalID, nextServers, depth+1)
+				// Передаем edns0Present
+				return r.recursiveResolve(ctx, question, originalID, nextServers, edns0Present, incomingExtra, depth+1)
 			} else if foundReferral && len(nextServers) == 0 {
 				log.Printf("Warning: Найдены NS-записи, но не удалось найти IP-адреса для них. Ждем другие ответы/ошибки.")
 			}
@@ -328,7 +358,8 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 }
 
 // resolveNSIP рекурсивно разрешает IP-адрес для NS-имени.
-func (r *Resolver) resolveNSIP(ctx context.Context, nsName string, originalID uint16, currentServers []string, depth int) ([]string, error) {
+// Добавлены параметры edns0Present и incomingExtra для обработки EDNS(0) опций.
+func (r *Resolver) resolveNSIP(ctx context.Context, nsName string, originalID uint16, currentServers []string, edns0Present bool, incomingExtra []dns.RR, depth int) ([]string, error) {
 	log.Printf("Debug: resolveNSIP: Разрешаем IP для NS-имени: %s (Глубина: %d)", nsName, depth)
 
 	var ips []string
@@ -344,7 +375,8 @@ func (r *Resolver) resolveNSIP(ctx context.Context, nsName string, originalID ui
 	}
 
 	// Попытка разрешить A-запись
-	respA, errA := r.recursiveResolve(ctx, questionA, originalID, currentServers, depth+1)
+	// Передаем edns0Present
+	respA, errA := r.recursiveResolve(ctx, questionA, originalID, currentServers, edns0Present, incomingExtra, depth+1)
 	if errA == nil && respA != nil {
 		for _, rr := range respA.Answer {
 			if a, ok := rr.(*dns.A); ok {
@@ -356,7 +388,8 @@ func (r *Resolver) resolveNSIP(ctx context.Context, nsName string, originalID ui
 	}
 
 	// Попытка разрешить AAAA-запись (если A не найдена или в дополнение к A)
-	respAAAA, errAAAA := r.recursiveResolve(ctx, questionAAAA, originalID, currentServers, depth+1)
+	// Передаем edns0Present
+	respAAAA, errAAAA := r.recursiveResolve(ctx, questionAAAA, originalID, currentServers, edns0Present, incomingExtra, depth+1)
 	if errAAAA == nil && respAAAA != nil {
 		for _, rr := range respAAAA.Answer {
 			if aaaa, ok := rr.(*dns.AAAA); ok {
@@ -379,7 +412,7 @@ func (r *Resolver) resolveCNAMEs(ctx context.Context, msg *dns.Msg, originalID u
 	// Создаем новый ответ, чтобы добавлять в него записи
 	finalMsg := new(dns.Msg)
 	finalMsg.SetReply(msg) // Копируем заголовок и вопросы
-	finalMsg.RecursionAvailable = true // <--- ДОБАВЛЕНО: Устанавливаем флаг RA
+	finalMsg.RecursionAvailable = true // Устанавливаем флаг RA
 
 	// Добавляем все существующие ответы
 	finalMsg.Answer = append(finalMsg.Answer, msg.Answer...)
@@ -397,7 +430,16 @@ func (r *Resolver) resolveCNAMEs(ctx context.Context, msg *dns.Msg, originalID u
 					Qclass: msg.Question[0].Qclass,
 				}
 				// Рекурсивно разрешаем новое имя
-				resolvedCnameMsg, err := r.recursiveResolve(ctx, newQuestion, originalID, rootServers, depth+1)
+				// Передаем edns0Present и incomingExtra из оригинального запроса
+				edns0Present := msg.IsEdns0() != nil // Получаем bool
+				var incomingExtraOpt []dns.RR
+				for _, rr := range msg.Extra {
+					if opt, ok := rr.(*dns.OPT); ok {
+						incomingExtraOpt = append(incomingExtraOpt, opt)
+						break
+					}
+				}
+				resolvedCnameMsg, err := r.recursiveResolve(ctx, newQuestion, originalID, rootServers, edns0Present, incomingExtraOpt, depth+1)
 				if err != nil {
 					log.Printf("Error: Не удалось разрешить целевое имя CNAME %s: %v", cname.Target, err)
 					return nil, err
@@ -410,6 +452,61 @@ func (r *Resolver) resolveCNAMEs(ctx context.Context, msg *dns.Msg, originalID u
 		}
 	}
 	return finalMsg, nil
+}
+
+// prefetchLoop периодически проверяет кеш на предмет записей, которые скоро истекут, и обновляет их.
+func (r *Resolver) prefetchLoop(ctx context.Context) {
+	ticker := time.NewTicker(prefetchCheckInterval)
+	defer ticker.Stop()
+
+	log.Printf("Debug: Prefetching loop started with interval %s and threshold ratio %.2f", prefetchCheckInterval, prefetchThresholdRatio)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Debug: Prefetching loop shutting down.")
+			return
+		case <-ticker.C:
+			log.Printf("Debug: Running prefetch check.")
+			soonToExpireEntries := r.cache.GetSoonToExpireEntries(prefetchThresholdRatio)
+
+			if len(soonToExpireEntries) > 0 {
+				log.Printf("Debug: Found %d entries for prefetching.", len(soonToExpireEntries))
+			}
+
+			for _, entry := range soonToExpireEntries {
+				// Запускаем запрос предзагрузки в отдельной горутине, чтобы не блокировать цикл
+				go func(e *CacheEntry) {
+					// Создаем отдельный контекст для запроса предзагрузки с таймаутом
+					prefetchCtx, prefetchCancel := context.WithTimeout(context.Background(), prefetchQueryTimeout)
+					defer prefetchCancel()
+
+					log.Printf("Debug: Prefetching query for %s (%s)", e.QueryName, e.QueryType)
+
+					// Создаем вопрос для предзагрузки
+					qtypeUint16 := dns.StringToType[e.QueryType]
+					if qtypeUint16 == 0 { // Если тип не распознан, по умолчанию A
+						qtypeUint16 = dns.TypeA
+					}
+					prefetchQuestion := dns.Question{
+						Name:   dns.Fqdn(e.QueryName),
+						Qtype:  qtypeUint16,
+						Qclass: dns.ClassINET,
+					}
+
+					// Выполняем рекурсивное разрешение.
+					// Для предзагрузки мы можем использовать фиктивный ID и EDNS(0) по умолчанию.
+					// EDNS(0) опции (ECS) не передаются, так как это не оригинальный клиентский запрос.
+					_, err := r.recursiveResolve(prefetchCtx, prefetchQuestion, uint16(rand.Intn(65535)), rootServers, true, nil, 0)
+					if err != nil {
+						log.Printf("Error: Prefetching %s (%s) failed: %v", e.QueryName, e.QueryType, err)
+					} else {
+						log.Printf("Debug: Prefetching %s (%s) successful. Cache should be updated.", e.QueryName, e.QueryType)
+					}
+				}(entry)
+			}
+		}
+	}
 }
 
 // rootServers - список корневых DNS-серверов.
