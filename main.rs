@@ -155,19 +155,16 @@ impl RecursiveResolver {
                 if let Some(cname_record) = response_message.answers().iter().find(|r| r.record_type() == RecordType::CNAME) {
                     if let Some(data) = cname_record.data() {
                         if let Some(cname) = data.as_cname() {
-                            // --- ИСПРАВЛЕНО: `as_cname` возвращает `Cname` у которого есть метод `name()` ---
                             name_to_resolve = cname.name().clone();
                         }
                     }
                     query_message = Message::new();
-                    // --- ИСПРАВЛЕНО: используем `Query::query` вместо `Query::with` ---
                     query_message.add_query(Query::query(name_to_resolve.clone(), query.query_type()));
                     current_servers = self.root_servers.clone();
                     continue;
                 }
                 
                 // Упрощенная валидация DNSSEC (проверка флага AD)
-                // --- ИСПРАВЛЕНО: `authenticated_data` переименован в `authentic_data` ---
                 if response_message.header().authentic_data() {
                     println!("DNSSEC validation successful (AD flag is set) for: {:?}", query.name());
                 } else {
@@ -184,9 +181,8 @@ impl RecursiveResolver {
                 if let Some(rdata) = record.data() {
                     if let Some(ns_name) = rdata.as_ns() {
                         if let Some(glue_record) = response_message.additionals().iter()
-                            .find(|r| r.name() == ns_name.name() && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA))
+                            .find(|r| r.name() == ns_name && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA))
                         {
-                            // --- ИСПРАВЛЕНО: `as_a` теперь возвращает `&A`, а не `&Ipv4Addr` ---
                             if let Some(ip) = glue_record.data().and_then(|data| data.as_a().map(|a| a.0)) {
                                 next_servers.push(SocketAddr::new(IpAddr::V4(ip), 53));
                             }
