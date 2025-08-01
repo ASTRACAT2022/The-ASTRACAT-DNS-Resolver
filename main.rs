@@ -1,6 +1,6 @@
 // main.rs - ASTRACAT DNS Resolver, высокопроизводительная и оптимизированная версия
 
-use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::fs::File;
@@ -12,10 +12,9 @@ use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
-use trust_dns_proto::op::{Message, Query, ResponseCode, OpCode};
-use trust_dns_proto::op::header::Header;
-use trust_dns_proto::rr::{Record, RecordType, Name};
-use trust_dns_proto::serialize::binary::{BinEncoder, BinDecodable, BinEncodable};
+use trust_dns_proto::op::{Message, Query, ResponseCode};
+use trust_dns_proto::rr::{Record, RecordType};
+use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -121,10 +120,10 @@ impl RecursiveResolver {
             let mut tasks = Vec::new();
             for server_addr in current_servers.iter() {
                 let sock_clone = Arc::clone(&self.udp_sock);
-                let mut buf = Vec::new();
-                // --- ИСПРАВЛЕНО: используем `to_bytes` вместо `emit` ---
-                query_message.to_bytes(&mut buf)?;
-                let server_addr_clone = server_addr.clone();
+                
+                // --- ИСПРАВЛЕНО: `to_bytes` теперь возвращает `Vec<u8>` ---
+                let buf = query_message.to_bytes()?;
+                let server_addr_clone = *server_addr;
 
                 tasks.push(tokio::spawn(async move {
                     if let Err(_) = sock_clone.send_to(&buf, server_addr_clone).await {
@@ -156,10 +155,15 @@ impl RecursiveResolver {
             if response_message.header().authoritative() {
                 // Если ответ содержит CNAME, нужно его обработать
                 if let Some(cname_record) = response_message.answers().iter().find(|r| r.record_type() == RecordType::CNAME) {
-                    name_to_resolve = cname_record.rdata().and_then(|data| data.as_cname().map(|c| c.name().clone())).unwrap();
-                    // --- ИСПРАВЛЕНО: создаем новую Query ---
+                    // --- ИСПРАВЛЕНО: используем `data()` вместо `rdata()` ---
+                    if let Some(data) = cname_record.data() {
+                        if let Some(cname) = data.as_cname() {
+                            name_to_resolve = cname.name().clone();
+                        }
+                    }
+                    // --- ИСПРАВЛЕНО: создаем новую Query с помощью `Query::with()` ---
                     query_message = Message::new();
-                    query_message.add_query(Query::new(name_to_resolve.clone(), query.query_type()));
+                    query_message.add_query(Query::with(name_to_resolve.clone(), query.query_type()));
                     // Начинаем резолвинг CNAME с корней, используя подсказки
                     current_servers = self.root_servers.clone();
                     continue;
@@ -167,7 +171,7 @@ impl RecursiveResolver {
                 
                 // Упрощенная валидация DNSSEC (проверка флага AD)
                 // --- ИСПРАВЛЕНО: проверка флага AD ---
-                if response_message.header().flags().authenticated_data() {
+                if response_message.header().authenticated_data() {
                     println!("DNSSEC validation successful (AD flag is set) for: {:?}", query.name());
                 } else {
                     println!("DNSSEC validation failed or not supported for: {:?}", query.name());
@@ -180,12 +184,15 @@ impl RecursiveResolver {
             // Если ответ неавторитетный, ищем новые NS-серверы
             let mut next_servers = Vec::new();
             for record in response_message.name_servers() {
-                if let Some(rdata) = record.rdata() {
+                // --- ИСПРАВЛЕНО: используем `data()` вместо `rdata()` ---
+                if let Some(rdata) = record.data() {
                     if let Some(ns_name) = rdata.as_ns() {
-                        if let Some(glue_record) = response_message.additional_records().iter()
+                        // --- ИСПРАВЛЕНО: используем `additionals()` вместо `additional_records()` ---
+                        if let Some(glue_record) = response_message.additionals().iter()
                             .find(|r| r.name() == ns_name.name() && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA))
                         {
-                            if let Some(ip) = glue_record.rdata().and_then(|data| data.as_a().map(|a| a.0)) {
+                            // --- ИСПРАВЛЕНО: используем `data()` вместо `rdata()` ---
+                            if let Some(ip) = glue_record.data().and_then(|data| data.as_a().map(|a| a.0)) {
                                 next_servers.push(SocketAddr::new(IpAddr::V4(ip), 53));
                             }
                         }
@@ -324,9 +331,8 @@ async fn handle_udp_requests(
                         resolver_clone,
                         rate_limit_map_clone,
                     ).await {
-                        let mut response_buf = Vec::new();
-                        // --- ИСПРАВЛЕНО: используем `to_bytes` вместо `emit` ---
-                        if let Ok(_) = response_msg.to_bytes(&mut response_buf) {
+                        // --- ИСПРАВЛЕНО: `to_bytes` теперь возвращает `Vec<u8>` ---
+                        if let Ok(response_buf) = response_msg.to_bytes() {
                             if let Err(e) = udp_sock_clone.send_to(&response_buf, src).await {
                                 eprintln!("Failed to send UDP response: {:?}", e);
                             }
@@ -339,7 +345,6 @@ async fn handle_udp_requests(
     }
 }
 
-// --- ИСПРАВЛЕНО: функция теперь возвращает `()` и обрабатывает ошибки внутри ---
 async fn handle_tcp_requests(
     listener: TcpListener,
     cache: Arc<DnsCache>,
@@ -375,10 +380,8 @@ async fn handle_tcp_requests(
                     resolver_clone,
                     rate_limit_map_clone,
                 ).await {
-                    let mut response_buf = Vec::new();
-                    
-                    // --- ИСПРАВЛЕНО: используем `to_bytes` вместо `emit` ---
-                    if let Ok(_) = response_msg.to_bytes(&mut response_buf) {
+                    // --- ИСПРАВЛЕНО: `to_bytes` теперь возвращает `Vec<u8>` ---
+                    if let Ok(response_buf) = response_msg.to_bytes() {
                         let len_prefix = (response_buf.len() as u16).to_be_bytes();
                         if let Err(e) = stream.write_all(&len_prefix).await {
                             eprintln!("Failed to send TCP length prefix: {:?}", e);
@@ -406,7 +409,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp_bind_addr = "0.0.0.0:5353";
     let udp_sock_raw = UdpSocket::bind(udp_bind_addr).await.expect("Failed to bind UDP socket");
     
-    // Set SO_REUSEPORT (if on Linux)
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -471,7 +473,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_clone = Arc::clone(&cache);
     let resolver_clone = Arc::clone(&resolver);
     let rate_limit_map_clone = Arc::clone(&rate_limit_map);
-    // --- ИСПРАВЛЕНО: `spawn` теперь работает, так как `handle_tcp_requests` не возвращает `Result` ---
     spawn(handle_tcp_requests(tcp_listener, cache_clone, resolver_clone, rate_limit_map_clone));
 
     println!("ASTRACAT DNS Resolver is ready to serve requests.");
