@@ -6,38 +6,42 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"syscall"
-	"time"
+	"sync"
 
-	"The-ASTRACAT-DNS-Resolver/resolver"
 	"github.com/miekg/dns"
+	"super-tuned-dns-root-data/resolver"
 )
 
 const (
 	port = 5353
 )
 
-// RequestData содержит данные, необходимые для обработки DNS-запроса
+// RequestData holds the data needed to process a DNS request.
 type RequestData struct {
 	request    []byte
 	clientAddr *net.UDPAddr
 }
 
 func main() {
-	// --- Настройка логирования ---
+	// --- Logging setup ---
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetPrefix("[ASTRACAT_DNS-RESOLVER] ")
 
-	// Создаем контекст для всего приложения
+	// Create a context for the entire application.
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
 
-	// Инициализируем наш резолвер, передавая контекст
+	// Initialize our resolver, passing the context.
 	dnsResolver := resolver.NewResolver(appCtx)
+	if dnsResolver == nil {
+		log.Fatal("Failed to initialize DNS resolver.")
+	}
 
-	// Создаем UDP-сервер с опцией SO_REUSEPORT
+	// Create a UDP server with SO_REUSEPORT option for performance.
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
@@ -46,7 +50,7 @@ func main() {
 					const SO_REUSEPORT = 15
 					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
 					if err != nil {
-						log.Printf("Error: Не удалось установить SO_REUSEPORT: %v", err)
+						log.Printf("Error: Failed to set SO_REUSEPORT: %v", err)
 					}
 				})
 			}
@@ -54,115 +58,147 @@ func main() {
 		},
 	}
 
-	addr := fmt.Sprintf(":%d", port)
-	conn, err := lc.ListenPacket(appCtx, "udp", addr)
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatalf("Ошибка при прослушивании UDP на %s: %v", addr, err)
+		log.Fatalf("Error: Failed to resolve UDP address: %v", err)
+	}
+
+	conn, err := lc.ListenPacket(appCtx, "udp", addr.String())
+	if err != nil {
+		log.Fatalf("Error: Failed to listen on UDP port: %v", err)
 	}
 	defer conn.Close()
 
-	log.Printf("ASTRACAT DNS Resolver запущен и слушает на %s", addr)
+	log.Printf("DNS server started on %s", conn.LocalAddr().String())
 
-	// Приводим тип conn к *net.UDPConn для вызовов ReadFromUDP и WriteToUDP
-	udpConn := conn.(*net.UDPConn)
+	// Use a buffered channel to handle incoming requests from the main loop.
+	requestQueue := make(chan RequestData, 1024)
 
-	// Создаем канал для передачи запросов рабочим потокам
-	requestQueue := make(chan RequestData, 1000)
+	// A WaitGroup to ensure all goroutines finish on shutdown.
+	var wg sync.WaitGroup
 
-	// Определяем количество рабочих потоков.
-	// Используем количество ядер CPU для оптимальной производительности.
-	numWorkers := runtime.NumCPU()
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-
-	log.Printf("Запускаем пул из %d рабочих потоков для обработки DNS-запросов", numWorkers)
+	// Start worker goroutines to process requests.
+	numWorkers := runtime.NumCPU() * 2 // A good starting point
 	for i := 0; i < numWorkers; i++ {
-		go handleDNSRequest(appCtx, dnsResolver, udpConn, requestQueue)
+		wg.Add(1)
+		go handleRequest(appCtx, &wg, dnsResolver, requestQueue, conn)
 	}
 
-	// Буфер для чтения входящих запросов
-	buffer := make([]byte, 512)
+	// A goroutine to listen for OS signals for graceful shutdown.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	for {
-		readErr := udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		if readErr != nil {
-			continue
-		}
-
-		n, clientAddr, err := udpConn.ReadFromUDP(buffer)
-
-		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-				select {
-				case <-appCtx.Done():
-					log.Println("Контекст приложения завершен, завершаем работу...")
-					return
-				default:
+	// Main loop to accept new requests.
+	go func() {
+		for {
+			select {
+			case <-appCtx.Done():
+				return
+			default:
+				buffer := make([]byte, 512)
+				conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				n, clientAddr, err := conn.ReadFromUDP(buffer)
+				if err != nil {
+					if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+						continue
+					}
+					log.Printf("Error: ReadFromUDP failed: %v", err)
 					continue
 				}
+
+				requestData := RequestData{
+					request:    buffer[:n],
+					clientAddr: clientAddr,
+				}
+				
+				// Push the request to the queue.
+				select {
+				case requestQueue <- requestData:
+				default:
+					log.Println("Warning: Request queue is full, dropping request.")
+				}
 			}
-			log.Printf("Ошибка чтения из UDP: %v", err)
-			continue
 		}
+	}()
 
-		// Копируем данные из буфера перед отправкой в канал,
-		// чтобы избежать состояния гонки.
-		requestCopy := make([]byte, n)
-		copy(requestCopy, buffer[:n])
+	// Wait for a signal to shut down.
+	<-sigChan
+	log.Println("Shutting down gracefully...")
 
-		// Отправляем запрос в канал для обработки рабочим потоком.
-		// Если канал переполнен, будем ждать.
-		select {
-		case requestQueue <- RequestData{request: requestCopy, clientAddr: clientAddr}:
-		case <-appCtx.Done():
-			log.Println("Контекст приложения завершен, завершаем работу...")
-			return
-		}
-	}
+	// Cancel the context and wait for all goroutines to finish.
+	appCancel()
+	close(requestQueue)
+	wg.Wait()
+
+	log.Println("Shutdown complete.")
 }
 
-// handleDNSRequest обрабатывает DNS-запросы, получая их из канала
-func handleDNSRequest(ctx context.Context, r *resolver.Resolver, conn *net.UDPConn, requestQueue <-chan RequestData) {
+// handleRequest processes requests from the queue in a separate goroutine.
+func handleRequest(ctx context.Context, wg *sync.WaitGroup, dnsResolver *resolver.Resolver, requestQueue <-chan RequestData, conn *net.UDPConn) {
+	defer wg.Done()
+	
 	for {
 		select {
 		case <-ctx.Done():
-			return // Завершаем горутину, если контекст приложения отменен
-		case data := <-requestQueue:
-			// Создаем контекст с таймаутом для каждого запроса
-			reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			return
+		case data, ok := <-requestQueue:
+			if !ok { // Channel closed
+				return
+			}
+			
+			// Unpack the DNS message.
+			msg := new(dns.Msg)
+			if err := msg.Unpack(data.request); err != nil {
+				log.Printf("Error: Failed to unpack DNS request from %s: %v", data.clientAddr.String(), err)
+				errorResponse := buildErrorDNSResponse(data.request, dns.RcodeFormatError)
+				if errorResponse != nil {
+					conn.WriteToUDP(errorResponse, data.clientAddr)
+				}
+				continue
+			}
 
-			response, err := r.Resolve(reqCtx, data.request, data.clientAddr)
+			if len(msg.Question) == 0 {
+				log.Printf("Warning: Empty question section from %s", data.clientAddr.String())
+				continue
+			}
+
+			// Resolve the query.
+			response, err := dnsResolver.Resolve(ctx, msg.Question[0])
 			if err != nil {
-				log.Printf("Error: Ошибка резолвинга запроса от %s: %v", data.clientAddr.String(), err)
+				log.Printf("Error: Failed to resolve query from %s: %v", data.clientAddr.String(), err)
 				rcode := dns.RcodeServerFailure
-				if err == context.DeadlineExceeded || err == context.Canceled {
-					rcode = dns.RcodeServerFailure
-				} else if err.Error() == "NXDOMAIN" {
+				if err == resolver.NXDOMAIN {
 					rcode = dns.RcodeNameError
 				}
 				errorResponse := buildErrorDNSResponse(data.request, rcode)
 				if errorResponse != nil {
-					_, writeErr := conn.WriteToUDP(errorResponse, data.clientAddr)
-					if writeErr != nil {
-						log.Printf("Error: Ошибка отправки ошибки клиенту %s: %v", data.clientAddr.String(), writeErr)
-					}
+					conn.WriteToUDP(errorResponse, data.clientAddr)
 				}
-			} else {
-				log.Printf("Debug: Запрос от %s успешно разрешен. Отправляем ответ.", data.clientAddr.String())
-				_, err = conn.WriteToUDP(response, data.clientAddr)
-				if err != nil {
-					log.Printf("Error: Ошибка отправки ответа клиенту %s: %v", data.clientAddr.String(), err)
-				} else {
-					log.Printf("Debug: Ответ успешно отправлен клиенту %s", data.clientAddr.String())
-				}
+				continue
 			}
-			cancel() // Не забываем отменять контекст
+			
+			// Set the response header and send the response.
+			response.SetReply(msg)
+			response.RecursionAvailable = true
+			packedResponse, packErr := response.Pack()
+			if packErr != nil {
+				log.Printf("Error: Failed to pack response for %s: %v", data.clientAddr.String(), packErr)
+				errorResponse := buildErrorDNSResponse(data.request, dns.RcodeServerFailure)
+				if errorResponse != nil {
+					conn.WriteToUDP(errorResponse, data.clientAddr)
+				}
+				continue
+			}
+
+			_, writeErr := conn.WriteToUDP(packedResponse, data.clientAddr)
+			if writeErr != nil {
+				log.Printf("Error: Failed to send response to %s: %v", data.clientAddr.String(), writeErr)
+			}
 		}
 	}
 }
 
-// buildErrorDNSResponse создает DNS-ответ с ошибкой на основе оригинального запроса
+// buildErrorDNSResponse creates a DNS error response based on the original request.
 func buildErrorDNSResponse(originalRequest []byte, rcode int) []byte {
 	msg := new(dns.Msg)
 	err := msg.Unpack(originalRequest)
@@ -177,16 +213,10 @@ func buildErrorDNSResponse(originalRequest []byte, rcode int) []byte {
 		}
 		return packedResponse
 	}
-
-	response := new(dns.Msg)
-	response.SetRcode(msg, rcode)
-	response.Authoritative = false
-	response.RecursionAvailable = true
-	if len(msg.Question) > 0 {
-		response.Question = []dns.Question{msg.Question[0]}
-	}
-
-	packedResponse, packErr := response.Pack()
+	
+	errorMsg := new(dns.Msg)
+	errorMsg.SetRcode(msg, rcode)
+	packedResponse, packErr := errorMsg.Pack()
 	if packErr != nil {
 		return nil
 	}
