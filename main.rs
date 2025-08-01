@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
 use trust_dns_proto::op::{Message, Query, ResponseCode};
 use trust_dns_proto::rr::{Record, RecordType};
-use trust_dns_proto::serialize::binary::{BinDecodable, BinEncodable};
+use trust_dns_proto::serialize::binary::{BinEncodable};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -107,7 +107,6 @@ impl RecursiveResolver {
         let mut current_servers = self.root_servers.clone();
 
         let mut query_message = Message::new();
-        // --- ИСПРАВЛЕНО: используем `add_query` ---
         query_message.add_query(query.clone());
         query_message.set_recursion_desired(false);
 
@@ -121,7 +120,6 @@ impl RecursiveResolver {
             for server_addr in current_servers.iter() {
                 let sock_clone = Arc::clone(&self.udp_sock);
                 
-                // --- ИСПРАВЛЕНО: `to_bytes` теперь возвращает `Vec<u8>` ---
                 let buf = query_message.to_bytes()?;
                 let server_addr_clone = *server_addr;
 
@@ -155,23 +153,22 @@ impl RecursiveResolver {
             if response_message.header().authoritative() {
                 // Если ответ содержит CNAME, нужно его обработать
                 if let Some(cname_record) = response_message.answers().iter().find(|r| r.record_type() == RecordType::CNAME) {
-                    // --- ИСПРАВЛЕНО: используем `data()` вместо `rdata()` ---
                     if let Some(data) = cname_record.data() {
                         if let Some(cname) = data.as_cname() {
+                            // --- ИСПРАВЛЕНО: `as_cname` возвращает `Cname` у которого есть метод `name()` ---
                             name_to_resolve = cname.name().clone();
                         }
                     }
-                    // --- ИСПРАВЛЕНО: создаем новую Query с помощью `Query::with()` ---
                     query_message = Message::new();
-                    query_message.add_query(Query::with(name_to_resolve.clone(), query.query_type()));
-                    // Начинаем резолвинг CNAME с корней, используя подсказки
+                    // --- ИСПРАВЛЕНО: используем `Query::query` вместо `Query::with` ---
+                    query_message.add_query(Query::query(name_to_resolve.clone(), query.query_type()));
                     current_servers = self.root_servers.clone();
                     continue;
                 }
                 
                 // Упрощенная валидация DNSSEC (проверка флага AD)
-                // --- ИСПРАВЛЕНО: проверка флага AD ---
-                if response_message.header().authenticated_data() {
+                // --- ИСПРАВЛЕНО: `authenticated_data` переименован в `authentic_data` ---
+                if response_message.header().authentic_data() {
                     println!("DNSSEC validation successful (AD flag is set) for: {:?}", query.name());
                 } else {
                     println!("DNSSEC validation failed or not supported for: {:?}", query.name());
@@ -184,14 +181,12 @@ impl RecursiveResolver {
             // Если ответ неавторитетный, ищем новые NS-серверы
             let mut next_servers = Vec::new();
             for record in response_message.name_servers() {
-                // --- ИСПРАВЛЕНО: используем `data()` вместо `rdata()` ---
                 if let Some(rdata) = record.data() {
                     if let Some(ns_name) = rdata.as_ns() {
-                        // --- ИСПРАВЛЕНО: используем `additionals()` вместо `additional_records()` ---
                         if let Some(glue_record) = response_message.additionals().iter()
                             .find(|r| r.name() == ns_name.name() && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA))
                         {
-                            // --- ИСПРАВЛЕНО: используем `data()` вместо `rdata()` ---
+                            // --- ИСПРАВЛЕНО: `as_a` теперь возвращает `&A`, а не `&Ipv4Addr` ---
                             if let Some(ip) = glue_record.data().and_then(|data| data.as_a().map(|a| a.0)) {
                                 next_servers.push(SocketAddr::new(IpAddr::V4(ip), 53));
                             }
@@ -280,7 +275,6 @@ async fn process_dns_query(
     
     println!("Cache miss for: {:?}", query.name());
     
-    // --- ИСПРАВЛЕНО: передаем ссылку на Query ---
     let response = resolver.resolve_iterative(&query).await.unwrap_or_else(|_| {
         let mut error_msg = Message::new();
         error_msg.set_response_code(ResponseCode::ServFail);
@@ -380,7 +374,6 @@ async fn handle_tcp_requests(
                     resolver_clone,
                     rate_limit_map_clone,
                 ).await {
-                    // --- ИСПРАВЛЕНО: `to_bytes` теперь возвращает `Vec<u8>` ---
                     if let Ok(response_buf) = response_msg.to_bytes() {
                         let len_prefix = (response_buf.len() as u16).to_be_bytes();
                         if let Err(e) = stream.write_all(&len_prefix).await {
