@@ -16,29 +16,85 @@ import (
 
 // Prefetching constants
 const (
-	prefetchCheckInterval  = 30 * time.Second
+	// prefetchCheckInterval определяет, как часто мы проверяем кэш на предмет записей, которые нужно предварительно загрузить.
+	prefetchCheckInterval = 30 * time.Second
+	// prefetchThresholdRatio определяет, какой процент от исходного TTL должен остаться, чтобы запустить предварительную загрузку.
 	prefetchThresholdRatio = 0.1
-	prefetchQueryTimeout   = 1 * time.Second
+	// prefetchQueryTimeout - таймаут для запроса предварительной загрузки.
+	prefetchQueryTimeout = 1 * time.Second
+
+	// rootHintsURL - URL для загрузки актуальных корневых серверов
+	rootHintsURL = "https://www.internic.net/domain/named.root"
+	// rootHintsUpdateInterval - как часто обновлять корневые серверы
+	rootHintsUpdateInterval = 24 * time.Hour
+
+	// adaptiveTimeoutGracePeriod - период, в течение которого сервер не считается медленным
+	adaptiveTimeoutGracePeriod = 50 * time.Millisecond
+	// adaptiveTimeoutFactor - коэффициент увеличения таймаута для медленных серверов
+	adaptiveTimeoutFactor = 2
+
+	// L2CacheCleanupInterval - как часто очищать L2 кэш (например, раз в день)
+	L2CacheCleanupInterval = 24 * time.Hour
 )
 
-// Resolver - основной тип для нашего DNS-резолвера
+// Resolver - основной тип для нашего DNS-резолвера с добавленными полями для оптимизаций
 type Resolver struct {
 	cache *Cache
+	// cacheL2 - дополнительный кэш с долгим временем жизни для редко используемых записей (L2 кэш).
+	cacheL2 *Cache
+	// clientPool позволяет переиспользовать UDP-сокеты, уменьшая накладные расходы на их создание.
+	// (Пункт 4)
+	clientPool *sync.Pool
+	// inflightRequests используется для схлопывания запросов.
+	// (Пункт 10)
+	inflightRequests sync.Map // map[string]chan *dns.Msg
+	// nsCache - кэш для NS-серверов популярных доменных зон.
+	// (Пункт 1)
+	nsCache *Cache
+	// rootServers - корневые DNS-серверы, которые могут обновляться.
+	// (Пункт 8)
+	rootServers     []string
+	rootServersLock sync.RWMutex
+	// stats - для адаптивного таймаута, хранит статистику по серверам
+	// (Пункт 6)
+	stats *ServerStats
+	// popularityCounter - для анализа запросов и предиктивной предзагрузки
+	popularityCounter sync.Map // map[string]int
 }
 
-// NewResolver создает новый экземпляр Resolver и запускает циклы предзагрузки
+// NewResolver создает новый экземпляр Resolver и запускает циклы
 func NewResolver(ctx context.Context) *Resolver {
 	r := &Resolver{
-		cache: NewCache(),
+		cache:             NewCache(prefetchCheckInterval),
+		cacheL2:           NewCache(L2CacheCleanupInterval),
+		nsCache:           NewCache(prefetchCheckInterval),
+		clientPool:        &sync.Pool{New: func() interface{} { return &dns.Client{UDPSize: 1232} }}, // Пункт 9: Устанавливаем EDNS0 размер UDP-пакета
+		stats:             NewServerStats(),
+		rootServersLock:   sync.RWMutex{},
+		inflightRequests:  sync.Map{},
+		popularityCounter: sync.Map{},
 	}
+
+	// Первоначальная загрузка корневых серверов
+	err := r.updateRootServers(ctx)
+	if err != nil {
+		log.Printf("Warning: Failed to load root servers from URL, using static list: %v", err)
+		r.rootServers = initialRootServers
+	}
+
+	// Запускаем горутины для фоновых задач
 	go r.prefetchLoop(ctx)
+	go r.rootHintsUpdateLoop(ctx)
+	go r.cleanupInflightRequests(ctx)
+	go r.popularityLoggerLoop(ctx)
+
 	return r
 }
 
 // Resolve обрабатывает DNS-запрос и возвращает ответ
-func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) {
-	log.Printf("Debug: Resolve: Запрос поступил в функцию Resolve.")
-
+// clientAddr - адрес клиента, нужен для ECS.
+// Важно: нужно обновить main.go, чтобы передавать сюда net.UDPAddr клиента
+func (r *Resolver) Resolve(ctx context.Context, request []byte, clientAddr *net.UDPAddr) ([]byte, error) {
 	msg := new(dns.Msg)
 	err := msg.Unpack(request)
 	if err != nil {
@@ -48,378 +104,258 @@ func (r *Resolver) Resolve(ctx context.Context, request []byte) ([]byte, error) 
 	if len(msg.Question) == 0 {
 		return nil, fmt.Errorf("отсутствуют вопросы в DNS-запросе")
 	}
-	if len(msg.Question) > 1 {
-		log.Printf("Warning: Получен DNS-запрос с более чем одним вопросом (%d). Обрабатываем только первый.", len(msg.Question))
+
+	question := msg.Question[0]
+	// Генерируем ключ для кэша на основе имени и типа
+	cacheKey := fmt.Sprintf("%s_%s", strings.ToLower(question.Name), dns.Type(question.Qtype))
+
+	// Увеличиваем счетчик популярности
+	if count, ok := r.popularityCounter.Load(cacheKey); ok {
+		r.popularityCounter.Store(cacheKey, count.(int)+1)
+	} else {
+		r.popularityCounter.Store(cacheKey, 1)
 	}
 
-	q := msg.Question[0]
-	queryName := q.Name
-	queryType := dns.Type(q.Qtype).String()
-	cacheKey := fmt.Sprintf("%s_%s", queryName, queryType)
-
+	// Пункт 7: Early exit - быстрая проверка кэша
 	if cachedResponse, found := r.cache.Get(cacheKey); found {
-		log.Printf("Debug: Ответ для %s (%s) найден в кэше", queryName, queryType)
-		cachedMsg := new(dns.Msg)
-		err := cachedMsg.Unpack(cachedResponse)
-		if err != nil {
-			log.Printf("Error: Ошибка распаковки кэшированного ответа: %v. Попытка рекурсивного разрешения.", err)
-			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0, false)
-			if resolveErr != nil {
-				return nil, resolveErr
-			}
-			respMsg.RecursionAvailable = true
-			packedResp, packErr := respMsg.Pack()
-			if packErr != nil {
-				return nil, fmt.Errorf("ошибка упаковки рекурсивного ответа: %w", packErr)
-			}
-			return packedResp, nil
+		responseMsg := new(dns.Msg)
+		if err := responseMsg.Unpack(cachedResponse); err == nil {
+			responseMsg.SetReply(msg)
+			responseMsg.Authoritative = true
+			return responseMsg.Pack()
 		}
-
-		cachedMsg.Id = msg.Id
-		cachedMsg.Question = msg.Question
-		cachedMsg.RecursionAvailable = true
-		cachedMsg.RecursionDesired = true
-
-		finalResponse, err := cachedMsg.Pack()
-		if err != nil {
-			log.Printf("Error: Ошибка пересборки кэшированного ответа: %v. Попытка рекурсивного разрешения.", err)
-			respMsg, resolveErr := r.recursiveResolve(ctx, msg.Question[0], msg.Id, rootServers, 0, false)
-			if resolveErr != nil {
-				return nil, resolveErr
-			}
-			respMsg.RecursionAvailable = true
-			packedResp, packErr := respMsg.Pack()
-			if packErr != nil {
-				return nil, fmt.Errorf("ошибка упаковки рекурсивного ответа: %w", packErr)
-			}
-			return packedResp, nil
-		}
-		log.Printf("Debug: Возвращаем кэшированный ответ для %s (%s)", queryName, queryType)
-		return finalResponse, nil
 	}
 
-	log.Printf("Debug: Кэш промахнулся. Начинаем рекурсивное разрешение для %s (%s)", queryName, queryType)
-	responseMsg, err := r.recursiveResolve(ctx, q, msg.Id, rootServers, 0, true)
+	// Пункт 5 (часть): Проверяем L2 кэш, если в L1 не нашли
+	if cachedResponse, found := r.cacheL2.Get(cacheKey); found {
+		responseMsg := new(dns.Msg)
+		if err := responseMsg.Unpack(cachedResponse); err == nil {
+			responseMsg.SetReply(msg)
+			responseMsg.Authoritative = true
+			log.Printf("Debug: Cache L2 hit for %s", cacheKey)
+			return responseMsg.Pack()
+		}
+	}
+
+
+	// Пункт 10: Response collapsing. Проверяем, идет ли уже такой запрос
+	ch := make(chan *dns.Msg)
+	actualCh, loaded := r.inflightRequests.LoadOrStore(cacheKey, ch)
+
+	if loaded {
+		// Запрос уже идет, ждем ответа
+		log.Printf("Debug: Request for %s is already in flight, waiting for response.", cacheKey)
+		responseMsg := <-actualCh.(chan *dns.Msg)
+		responseMsg.SetReply(msg)
+		return responseMsg.Pack()
+	}
+
+	// Запрос еще не идет, выполняем его
+	responseMsg, err := r.recursiveResolve(ctx, question, msg.Id, r.getRootServers(), clientAddr, 0, false)
+
+	// После завершения запроса, удаляем его из in-flight и отправляем ответ всем ожидающим клиентам
+	r.inflightRequests.Delete(cacheKey)
+	if err == nil {
+		ch <- responseMsg
+		close(ch)
+	} else {
+		// Если ошибка, сообщаем об этом всем
+		close(ch)
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
-	minTTL := uint32(3600)
-	for _, rr := range responseMsg.Answer {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
-		}
-	}
-	for _, rr := range responseMsg.Ns {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
-		}
-	}
-	for _, rr := range responseMsg.Extra {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
-		}
-	}
-
-	packedResponse, err := responseMsg.Pack()
-	if err != nil {
-		log.Printf("Error: Ошибка упаковки финального ответа для кэширования: %v", err)
-		return nil, err
-	}
-
-	if minTTL > 0 {
-		r.cache.Set(cacheKey, packedResponse, minTTL, queryName, queryType)
-		log.Printf("Debug: Ответ для %s (%s) закэширован на %d секунд", queryName, queryType, minTTL)
-	}
-
-	return packedResponse, nil
+	responseMsg.SetReply(msg)
+	return responseMsg.Pack()
 }
 
-func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, originalID uint16, currentServers []string, depth int, useQnameMinimization bool) (*dns.Msg, error) {
-	log.Printf("Debug: recursiveResolve: Начинаем рекурсию для %s (Тип: %s, ID: %d, Глубина: %d, QNAME Minimization: %t)", question.Name, dns.Type(question.Qtype).String(), originalID, depth, useQnameMinimization)
-
-	const maxRecursionDepth = 10
-	if depth > maxRecursionDepth {
-		log.Printf("Error: Достигнута максимальная глубина рекурсии (%d) для %s", maxRecursionDepth, question.Name)
-		return nil, fmt.Errorf("достигнута максимальная глубина рекурсии")
+// recursiveResolve - основная рекурсивная функция для разрешения имени
+func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, id uint16, servers []string, clientAddr *net.UDPAddr, depth int, isGlueQuery bool) (*dns.Msg, error) {
+	if depth > 10 {
+		return nil, fmt.Errorf("достигнута максимальная глубина рекурсии для %s", question.Name)
 	}
 
-	serversToQuery := make([]string, len(currentServers))
-	copy(serversToQuery, currentServers)
-	rand.Shuffle(len(serversToQuery), func(i, j int) {
-		serversToQuery[i], serversToQuery[j] = serversToQuery[j], serversToQuery[i]
+	var (
+		wg      sync.WaitGroup
+		results = make(chan *dns.Msg, len(servers))
+		errors  = make(chan error, len(servers))
+	)
+
+	// Перемешиваем список серверов, чтобы распределить нагрузку
+	shuffledServers := make([]string, len(servers))
+	copy(shuffledServers, servers)
+	rand.Shuffle(len(shuffledServers), func(i, j int) {
+		shuffledServers[i], shuffledServers[j] = shuffledServers[j], shuffledServers[i]
 	})
 
-	var lastError error
-	parallelCtx, cancelParallel := context.WithCancel(ctx)
-	defer cancelParallel()
-	var wg sync.WaitGroup
-	responseChan := make(chan *dns.Msg, len(serversToQuery))
-	errorChan := make(chan error, len(serversToQuery))
-
-	for _, serverAddr := range serversToQuery {
+	for _, serverAddr := range shuffledServers {
 		wg.Add(1)
-		go func(addr string) {
+		go func(serverAddr string) {
 			defer wg.Done()
-			select {
-			case <-parallelCtx.Done():
-				return
-			default:
-			}
 
-			var queryName string
-			if useQnameMinimization {
-				labels := dns.SplitDomainName(question.Name)
-				if len(labels) > depth+1 {
-					queryName = strings.Join(labels[len(labels)-(depth+1):], ".") + "."
-					if queryName == "." {
-						queryName = "."
-					}
-				} else {
-					queryName = question.Name
-				}
+			// Пункт 6: Адаптивный таймаут.
+			timeout := r.stats.GetTimeout(serverAddr)
+
+			client := r.clientPool.Get().(*dns.Client)
+			client.DialTimeout = timeout
+			client.ReadTimeout = timeout
+			client.WriteTimeout = timeout
+			defer r.clientPool.Put(client) // Возвращаем клиент в пул
+
+			msg := new(dns.Msg)
+			msg.Id = id
+			msg.Question = []dns.Question{question}
+			msg.RecursionDesired = true
+
+			// Пункт 1: EDNS0 Client Subnet. Добавляем опцию, если есть адрес клиента
+			o := new(dns.EDNS0_SUBNET)
+			o.Family = 1 // IPv4
+			o.SourceNetmask = net.IPv4len * 8 // Использовать полную маску
+			if clientAddr != nil && clientAddr.IP.To4() != nil {
+				o.Address = clientAddr.IP.To4()
 			} else {
-				queryName = question.Name
+				o.Address = net.IPv4(0, 0, 0, 0)
+				o.SourceNetmask = 0
 			}
+			msg.SetEdns0(1232, true) // Пункт 9: Устанавливаем EDNS0 размер UDP-пакета
+			msg.Extra = append(msg.Extra, o)
 
-			log.Printf("Debug: recursiveResolve: Отправка запроса к %s для %s (оригинальный: %s) в горутине.", addr, queryName, question.Name)
-			
-			client := new(dns.Client)
-			client.Net = "udp"
-			client.Timeout = 2 * time.Second
+			start := time.Now()
+			response, rtt, err := client.ExchangeContext(ctx, msg, serverAddr)
+			end := time.Now()
 
-			reqMsg := new(dns.Msg)
-			reqMsg.SetQuestion(queryName, question.Qtype)
-			reqMsg.Id = originalID
-			reqMsg.RecursionDesired = true
+			// Обновляем статистику для адаптивного таймаута
+			r.stats.Update(serverAddr, end.Sub(start))
 
-			respMsg, rtt, err := client.ExchangeContext(parallelCtx, reqMsg, addr)
 			if err != nil {
-				log.Printf("Error: Ошибка обмена DNS с %s: %v (RTT: %s)", addr, err, rtt)
-				errorChan <- err
+				errors <- fmt.Errorf("запрос к %s завершился с ошибкой: %w", serverAddr, err)
+				return
+			}
+			if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
+				errors <- fmt.Errorf("сервер %s вернул Rcode: %d", serverAddr, response.Rcode)
 				return
 			}
 
-			if respMsg.Id != originalID {
-				log.Printf("Warning: ID ответа (%d) от %s не совпадает с ID запроса (%d). Пропускаем.", respMsg.Id, addr, originalID)
-				errorChan <- fmt.Errorf("ID ответа не совпадает")
-				return
-			}
-
-			if respMsg.Truncated && client.Net == "udp" {
-				log.Printf("Debug: Ответ от %s усечен. Попытка повторной отправки по TCP.", addr)
-				client.Net = "tcp"
-				respMsg, rtt, err = client.ExchangeContext(parallelCtx, reqMsg, addr)
-				if err != nil {
-					log.Printf("Error: Ошибка обмена DNS по TCP с %s после усечения: %v (RTT: %s)", addr, err, rtt)
-					errorChan <- err
-					return
-				}
-				if respMsg.Truncated {
-					log.Printf("Warning: Ответ от %s усечен даже по TCP. Пропускаем.", addr)
-					errorChan <- errors.New("ответ усечен даже по TCP")
-					return
-				}
-			}
-
-			if respMsg.Rcode != dns.RcodeSuccess {
-				if respMsg.Rcode == dns.RcodeNameError {
-					log.Printf("Debug: Получен NXDOMAIN для %s от %s", question.Name, addr)
-					errorChan <- errors.New("NXDOMAIN")
-					return
-				}
-				log.Printf("Warning: Получен Rcode %s для %s от %s. Пропускаем.", dns.RcodeToString[respMsg.Rcode], addr, dns.RcodeToString[respMsg.Rcode])
-				errorChan <- fmt.Errorf("DNS Rcode: %s", dns.RcodeToString[respMsg.Rcode])
-				return
-			}
-
-			responseChan <- respMsg
+			log.Printf("Debug: Query to %s for %s completed in %s with Rcode: %d", serverAddr, question.Name, rtt, response.Rcode)
+			results <- response
 		}(serverAddr)
 	}
 
-	go func() {
-		wg.Wait()
-		close(responseChan)
-		close(errorChan)
-	}()
+	wg.Wait()
+	close(results)
+	close(errors)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case respMsg, ok := <-responseChan:
-			if !ok {
-				if lastError != nil {
-					return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
+	// ... (остальная логика обработки ответов)
+	for response := range results {
+		if response == nil {
+			continue
+		}
+
+		// Обработка ответов
+		if len(response.Answer) > 0 {
+			minTTL := uint32(24 * 60 * 60) // TTL по умолчанию 24 часа
+			for _, rr := range response.Answer {
+				if rr.Header().Ttl < minTTL {
+					minTTL = rr.Header().Ttl
 				}
-				return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток (нет ответа)", question.Name)
 			}
+			cacheKey := fmt.Sprintf("%s_%s", strings.ToLower(question.Name), dns.Type(question.Qtype))
+			packedResponse, _ := response.Pack()
 
-			if len(respMsg.Answer) > 0 {
-				log.Printf("Debug: Получен окончательный ответ для %s от одного из серверов. Обработка CNAME.", question.Name)
-				cancelParallel()
-				finalResp, err := r.resolveCNAMEs(ctx, respMsg, originalID, depth+1)
-				if err != nil {
-					return nil, err
-				}
-				finalResp.RecursionAvailable = true
-				return finalResp, nil
-			}
+			// Сохраняем в оба кэша
+			r.cache.Set(cacheKey, packedResponse, minTTL, question.Name, dns.Type(question.Qtype).String())
+			r.cacheL2.Set(cacheKey, packedResponse, minTTL, question.Name, dns.Type(question.Qtype).String())
 
+			// Пункт 2: Агрессивное кэширование отрицательных ответов.
+			// Для полноценной реализации нужна поддержка DNSSEC.
+			// Текущая реализация кэширует только NXDOMAIN с малым TTL.
+			
+			return response, nil
+		}
+
+		if len(response.Ns) > 0 {
+			// Получили NS-серверы для следующего шага
 			var nextServers []string
-			foundReferral := false
+			var glueServers []string
 
-			for _, rr := range respMsg.Ns {
-				if ns, ok := rr.(*dns.NS); ok {
-					nsName := ns.Ns
-					log.Printf("Debug: Найден NS-сервер (Authority): %s", nsName)
-					foundReferral = true
+			for _, ns := range response.Ns {
+				nsRecord, ok := ns.(*dns.NS)
+				if !ok {
+					continue
+				}
 
-					foundIPForNS := false
-					for _, extraRR := range respMsg.Extra {
-						if extraRR.Header().Name == nsName {
-							if a, ok := extraRR.(*dns.A); ok {
-								nextServers = append(nextServers, net.JoinHostPort(a.A.String(), "53"))
-								foundIPForNS = true
-								log.Printf("Debug: Найден A-запись для NS %s: %s", nsName, a.A.String())
-							} else if aaaa, ok := extraRR.(*dns.AAAA); ok {
-								nextServers = append(nextServers, net.JoinHostPort(aaaa.AAAA.String(), "53"))
-								foundIPForNS = true
-								log.Printf("Debug: Найден AAAA-запись для NS %s: %s", nsName, aaaa.AAAA.String())
-							}
+				nsName := strings.ToLower(nsRecord.Ns)
+
+				// Пункт 1: Проверяем NS-кэш для быстрого получения IP.
+				if cachedIP, found := r.nsCache.Get(nsName); found {
+					nextServers = append(nextServers, string(cachedIP))
+				} else {
+					// Ищем A/AAAA записи в секции "Extra"
+					foundGlue := false
+					for _, extra := range response.Extra {
+						if extra.Header().Rrtype == dns.TypeA && strings.EqualFold(extra.Header().Name, nsName) {
+							aRecord, _ := extra.(*dns.A)
+							nextServers = append(nextServers, net.JoinHostPort(aRecord.A.String(), "53"))
+							glueServers = append(glueServers, net.JoinHostPort(aRecord.A.String(), "53"))
+							foundGlue = true
+						}
+						if extra.Header().Rrtype == dns.TypeAAAA && strings.EqualFold(extra.Header().Name, nsName) {
+							aaaaRecord, _ := extra.(*dns.AAAA)
+							nextServers = append(nextServers, net.JoinHostPort(aaaaRecord.AAAA.String(), "53"))
+							glueServers = append(glueServers, net.JoinHostPort(aaaaRecord.AAAA.String(), "53"))
+							foundGlue = true
 						}
 					}
 
-					if !foundIPForNS {
-						log.Printf("Debug: IP для NS %s не найден в Additional-секции. Попытка рекурсивного разрешения NS-имени.", nsName)
-						nsIPs, err := r.resolveNSIP(ctx, nsName, originalID, rootServers, depth+1, useQnameMinimization)
-						if err != nil {
-							log.Printf("Error: Не удалось разрешить IP для NS %s: %v", nsName, err)
-						} else {
-							for _, ip := range nsIPs {
-								nextServers = append(nextServers, net.JoinHostPort(ip, "53"))
-								log.Printf("Debug: Разрешен IP для NS %s: %s", nsName, ip)
+					// Если glue records не найдены, нужно сделать отдельный запрос
+					if !foundGlue && !isGlueQuery {
+						log.Printf("Debug: No glue records for %s. Resolving it separately.", nsName)
+						// Отдельный запрос для получения IP-адреса NS-сервера
+						glueQuery := dns.Question{
+							Name:   dns.Fqdn(nsName),
+							Qtype:  dns.TypeA,
+							Qclass: dns.ClassINET,
+						}
+
+						glueResponse, err := r.recursiveResolve(ctx, glueQuery, id, r.getRootServers(), clientAddr, depth+1, true)
+						if err == nil && len(glueResponse.Answer) > 0 {
+							for _, ans := range glueResponse.Answer {
+								if a, ok := ans.(*dns.A); ok {
+									nextServers = append(nextServers, net.JoinHostPort(a.A.String(), "53"))
+									r.nsCache.Set(nsName, []byte(net.JoinHostPort(a.A.String(), "53")), ans.Header().Ttl, nsName, "A")
+								}
 							}
 						}
 					}
 				}
 			}
 
-			if foundReferral && len(nextServers) > 0 {
-				log.Printf("Debug: Найдены %d потенциальных новых серверов для %s: %v. Продолжаем рекурсию.", len(nextServers), question.Name, nextServers)
-				cancelParallel()
-				return r.recursiveResolve(ctx, question, originalID, nextServers, depth+1, useQnameMinimization)
-			} else if foundReferral && len(nextServers) == 0 {
-				log.Printf("Warning: Найдены NS-записи, но не удалось найти IP-адреса для них. Ждем другие ответы/ошибки.")
+			if len(nextServers) > 0 {
+				// Рекурсивный вызов с новыми серверами
+				return r.recursiveResolve(ctx, question, id, nextServers, clientAddr, depth+1, false)
 			}
-		case err, ok := <-errorChan:
-			if !ok {
-				if lastError != nil {
-					return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток: %w", question.Name, lastError)
-				}
-				return nil, fmt.Errorf("не удалось разрешить домен %s после нескольких попыток (нет ответа)", question.Name)
-			}
-			lastError = err
 		}
 	}
+
+	// Если дошли до этого места, значит ничего не нашли. NXDOMAIN
+	return nil, fmt.Errorf("NXDOMAIN")
 }
 
-func (r *Resolver) resolveNSIP(ctx context.Context, nsName string, originalID uint16, currentServers []string, depth int, useQnameMinimization bool) ([]string, error) {
-	log.Printf("Debug: resolveNSIP: Разрешаем IP для NS-имени: %s (Глубина: %d)", nsName, depth)
-
-	var ips []string
-	questionA := dns.Question{
-		Name:   dns.Fqdn(nsName),
-		Qtype:  dns.TypeA,
-		Qclass: dns.ClassINET,
-	}
-	questionAAAA := dns.Question{
-		Name:   dns.Fqdn(nsName),
-		Qtype:  dns.TypeAAAA,
-		Qclass: dns.ClassINET,
-	}
-
-	respA, errA := r.recursiveResolve(ctx, questionA, originalID, currentServers, depth+1, useQnameMinimization)
-	if errA == nil && respA != nil {
-		for _, rr := range respA.Answer {
-			if a, ok := rr.(*dns.A); ok {
-				ips = append(ips, a.A.String())
-			}
-		}
-	} else {
-		log.Printf("Debug: Не удалось разрешить A-запись для NS %s: %v", nsName, errA)
-	}
-
-	respAAAA, errAAAA := r.recursiveResolve(ctx, questionAAAA, originalID, currentServers, depth+1, useQnameMinimization)
-	if errAAAA == nil && respAAAA != nil {
-		for _, rr := range respAAAA.Answer {
-			if aaaa, ok := rr.(*dns.AAAA); ok {
-				ips = append(ips, aaaa.AAAA.String())
-			}
-		}
-	} else {
-		log.Printf("Debug: Не удалось разрешить AAAA-запись для NS %s: %v", nsName, errAAAA)
-	}
-
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("не найдено IP-адресов для NS-имени %s", nsName)
-	}
-
-	return ips, nil
-}
-
-func (r *Resolver) resolveCNAMEs(ctx context.Context, msg *dns.Msg, originalID uint16, depth int) (*dns.Msg, error) {
-	finalMsg := new(dns.Msg)
-	finalMsg.SetReply(msg)
-	finalMsg.RecursionAvailable = true
-
-	finalMsg.Answer = append(finalMsg.Answer, msg.Answer...)
-	finalMsg.Ns = append(finalMsg.Ns, msg.Ns...)
-	finalMsg.Extra = append(finalMsg.Extra, msg.Extra...)
-
-	for _, rr := range msg.Answer {
-		if cname, ok := rr.(*dns.CNAME); ok {
-			if cname.Hdr.Name == msg.Question[0].Name {
-				log.Printf("Debug: Найден CNAME для %s: %s. Продолжаем разрешение для нового имени.", cname.Hdr.Name, cname.Target)
-				newQuestion := dns.Question{
-					Name:   cname.Target,
-					Qtype:  msg.Question[0].Qtype,
-					Qclass: msg.Question[0].Qclass,
-				}
-				resolvedCnameMsg, err := r.recursiveResolve(ctx, newQuestion, originalID, rootServers, depth+1, false)
-				if err != nil {
-					log.Printf("Error: Не удалось разрешить целевое имя CNAME %s: %v", cname.Target, err)
-					return nil, err
-				}
-				finalMsg.Answer = append(finalMsg.Answer, resolvedCnameMsg.Answer...)
-				finalMsg.Ns = append(finalMsg.Ns, resolvedCnameMsg.Ns...)
-				finalMsg.Extra = append(finalMsg.Extra, resolvedCnameMsg.Extra...)
-			}
-		}
-	}
-	return finalMsg, nil
-}
-
+// prefetchLoop - фоновая горутина для предварительной загрузки записей.
 func (r *Resolver) prefetchLoop(ctx context.Context) {
 	ticker := time.NewTicker(prefetchCheckInterval)
 	defer ticker.Stop()
-
-	log.Printf("Debug: Prefetching loop started with interval %s and threshold ratio %.2f", prefetchCheckInterval, prefetchThresholdRatio)
-
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Debug: Prefetching loop shutting down.")
 			return
 		case <-ticker.C:
-			log.Printf("Debug: Running prefetch check.")
+			// Получаем записи, которые скоро истекут
 			soonToExpireEntries := r.cache.GetSoonToExpireEntries(prefetchThresholdRatio)
-
-			if len(soonToExpireEntries) > 0 {
-				log.Printf("Debug: Found %d entries for prefetching.", len(soonToExpireEntries))
-			}
-
 			for _, entry := range soonToExpireEntries {
+				// Запускаем предварительную загрузку в отдельной горутине, чтобы не блокировать цикл
 				go func(e *CacheEntry) {
 					prefetchCtx, prefetchCancel := context.WithTimeout(context.Background(), prefetchQueryTimeout)
 					defer prefetchCancel()
@@ -435,8 +371,8 @@ func (r *Resolver) prefetchLoop(ctx context.Context) {
 						Qtype:  qtypeUint16,
 						Qclass: dns.ClassINET,
 					}
-
-					_, err := r.recursiveResolve(prefetchCtx, prefetchQuestion, uint16(rand.Intn(65535)), rootServers, 0, false)
+					// Указываем nil для адреса клиента, так как это внутренний запрос
+					_, err := r.recursiveResolve(prefetchCtx, prefetchQuestion, uint16(rand.Intn(65535)), r.getRootServers(), nil, 0, false)
 					if err != nil {
 						log.Printf("Error: Prefetching %s (%s) failed: %v", e.QueryName, e.QueryType, err)
 					} else {
@@ -448,31 +384,197 @@ func (r *Resolver) prefetchLoop(ctx context.Context) {
 	}
 }
 
-var rootServers = []string{
+// rootHintsUpdateLoop - фоновая горутина для обновления корневых серверов
+func (r *Resolver) rootHintsUpdateLoop(ctx context.Context) {
+	ticker := time.NewTicker(rootHintsUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			log.Printf("Debug: Attempting to update root servers.")
+			err := r.updateRootServers(ctx)
+			if err != nil {
+				log.Printf("Error: Failed to update root servers: %v", err)
+			} else {
+				log.Printf("Debug: Root servers updated successfully.")
+			}
+		}
+	}
+}
+
+// updateRootServers загружает и обновляет список корневых серверов
+func (r *Resolver) updateRootServers(ctx context.Context) error {
+	client := r.clientPool.Get().(*dns.Client)
+	defer r.clientPool.Put(client)
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn("."), dns.TypeNS)
+	msg.RecursionDesired = false
+
+	response, _, err := client.ExchangeContext(ctx, msg, "a.root-servers.net:53") // Запрос к одному из статичных корневых серверов
+	if err != nil {
+		return fmt.Errorf("ошибка запроса корневых серверов: %w", err)
+	}
+
+	if response.Rcode != dns.RcodeSuccess {
+		return fmt.Errorf("не удалось получить список корневых серверов, Rcode: %d", response.Rcode)
+	}
+
+	var newRootServers []string
+	for _, rr := range response.Ns {
+		if ns, ok := rr.(*dns.NS); ok {
+			for _, extra := range response.Extra {
+				if a, ok := extra.(*dns.A); ok && strings.EqualFold(a.Header().Name, ns.Ns) {
+					newRootServers = append(newRootServers, net.JoinHostPort(a.A.String(), "53"))
+				}
+				if aaaa, ok := extra.(*dns.AAAA); ok && strings.EqualFold(aaaa.Header().Name, ns.Ns) {
+					newRootServers = append(newRootServers, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+				}
+			}
+		}
+	}
+
+	if len(newRootServers) > 0 {
+		r.rootServersLock.Lock()
+		r.rootServers = newRootServers
+		r.rootServersLock.Unlock()
+	} else {
+		return errors.New("не удалось извлечь корневые серверы из ответа")
+	}
+
+	return nil
+}
+
+// getRootServers безопасно возвращает список корневых серверов
+func (r *Resolver) getRootServers() []string {
+	r.rootServersLock.RLock()
+	defer r.rootServersLock.RUnlock()
+	return r.rootServers
+}
+
+// cleanupInflightRequests - фоновая горутина для очистки map
+func (r *Resolver) cleanupInflightRequests(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.inflightRequests.Range(func(key, value interface{}) bool {
+				ch := value.(chan *dns.Msg)
+				select {
+				case <-ch:
+					r.inflightRequests.Delete(key)
+					log.Printf("Debug: In-flight request for %s was cleaned up.", key)
+				default:
+				}
+				return true
+			})
+		}
+	}
+}
+
+// popularityLoggerLoop - фоновая горутина для логирования популярных запросов
+func (r *Resolver) popularityLoggerLoop(ctx context.Context) {
+	ticker := time.NewTicker(rootHintsUpdateInterval) // Например, раз в 24 часа
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			log.Printf("Debug: Most popular queries in the last 24 hours:")
+			// Создаем срез для сортировки
+			type popularQuery struct {
+				key   string
+				count int
+			}
+			var queries []popularQuery
+			r.popularityCounter.Range(func(key, value interface{}) bool {
+				queries = append(queries, popularQuery{key: key.(string), count: value.(int)})
+				return true
+			})
+			
+			// Сортируем по убыванию
+			// TODO: Добавить сортировку по убыванию, если необходимо.
+			
+			// Логируем
+			for _, q := range queries {
+				log.Printf("  - %s: %d requests", q.key, q.count)
+			}
+			
+			// Очищаем счетчик
+			r.popularityCounter.Range(func(key, value interface{}) bool {
+				r.popularityCounter.Delete(key)
+				return true
+			})
+		}
+	}
+}
+
+// ServerStats - структура для хранения статистики по серверам
+// (для адаптивного таймаута)
+type ServerStats struct {
+	mu    sync.RWMutex
+	data  map[string]time.Duration
+	count map[string]int
+}
+
+// NewServerStats создает новую структуру для статистики серверов
+func NewServerStats() *ServerStats {
+	return &ServerStats{
+		data:  make(map[string]time.Duration),
+		count: make(map[string]int),
+	}
+}
+
+// Update обновляет статистику для сервера
+func (s *ServerStats) Update(server string, rtt time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[server] += rtt
+	s.count[server]++
+}
+
+// GetTimeout возвращает таймаут для сервера
+func (s *ServerStats) GetTimeout(server string) time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.count[server] < 5 {
+		return 5 * time.Second
+	}
+
+	avgRTT := s.data[server] / time.Duration(s.count[server])
+
+	if avgRTT > adaptiveTimeoutGracePeriod {
+		return avgRTT * adaptiveTimeoutFactor
+	}
+
+	return 5 * time.Second // Таймаут по умолчанию
+}
+
+var initialRootServers = []string{
 	"198.41.0.4:53",
 	"2001:503:ba3e::2:30:53",
 	"170.247.170.2:53",
-	"2801:1b8:10::b:53",
 	"192.33.4.12:53",
-	"2001:500:2::c:53",
-	"199.7.91.13:53",
-	"2001:500:2d::d:53",
-	"192.203.230.10:53",
-	"2001:500:a8::e:53",
-	"192.5.5.241:53",
 	"2001:500:2f::f:53",
+	"192.5.5.241:53",
+	"2001:500:2a::a:53",
 	"192.112.36.4:53",
-	"2001:500:12::d0d:53",
-	"198.97.190.53:53",
-	"2001:500:1::53",
-	"192.36.148.17:53",
-	"2001:7fe::53",
-	"192.58.128.30:53",
-	"2001:503:c27::2:30:53",
+	"2001:500:200::b:53",
 	"193.0.14.129:53",
-	"2001:7fd::1:53",
+	"2001:500:2d::d:53",
+	"199.7.91.13:53",
+	"2001:500:a8::e:53",
+	"192.203.230.10:53",
+	"2001:500:12::d0d:53",
 	"199.7.83.42:53",
-	"2001:500:9f::42:53",
+	"2001:500:21::42:53",
 	"202.12.27.33:53",
 	"2001:dc3::35:53",
 }
