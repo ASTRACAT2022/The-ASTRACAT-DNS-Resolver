@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
+	"os"
 	"runtime"
 	"syscall"
 	"time"
@@ -20,8 +20,9 @@ const (
 
 func main() {
 	// --- Настройка логирования ---
-	log.SetOutput(io.Discard)
-	// log.SetOutput(os.Stdout) // Раскомментируйте эту строку и добавьте "os" в импорты для отладки
+	// В этой версии мы используем os.Stdout для вывода логов,
+	// поэтому io больше не требуется.
+	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetPrefix("[ASTRACAT_DNS-RESOLVER] ")
 
@@ -42,11 +43,10 @@ func main() {
 					// Используем числовое значение 15 для SO_REUSEPORT, так как в некоторых средах
 					// константа syscall.SO_REUSEPORT может быть не определена.
 					const SO_REUSEPORT = 15
+					// Включаем SO_REUSEPORT, чтобы несколько процессов могли прослушивать один и тот же порт
 					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
 					if err != nil {
-						log.Printf("Warning: Не удалось установить SO_REUSEPORT: %v", err)
-					} else {
-						log.Println("Debug: Опция SO_REUSEPORT успешно установлена.")
+						log.Printf("Error: Не удалось установить SO_REUSEPORT: %v", err)
 					}
 				})
 			}
@@ -54,52 +54,57 @@ func main() {
 		},
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+	addr := fmt.Sprintf(":%d", port)
+	conn, err := lc.ListenPacket(appCtx, "udp", addr)
 	if err != nil {
-		log.Fatalf("Fatal: Ошибка разрешения UDP-адреса: %v", err)
+		log.Fatalf("Ошибка при прослушивании UDP на %s: %v", addr, err)
 	}
+	defer conn.Close()
 
-	pc, err := lc.ListenPacket(appCtx, "udp", addr.String())
-	if err != nil {
-		log.Fatalf("Fatal: Ошибка при прослушивании UDP: %v", err)
-	}
-	defer pc.Close()
+	log.Printf("ASTRACAT DNS Resolver запущен и слушает на %s", addr)
 
-	conn := pc.(*net.UDPConn)
-	
-	fmt.Printf("The ASTRACAT DNS Resolver запущен на UDP :%d\n", port)
+	// Буфер для чтения входящих запросов
+	buffer := make([]byte, 512)
 
-	// Основной цикл обработки запросов
+	// Приводим тип conn к *net.UDPConn для вызовов ReadFromUDP и WriteToUDP
+	udpConn := conn.(*net.UDPConn)
+
 	for {
-		buf := make([]byte, 512)
-		n, clientAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("Error: Ошибка чтения из UDP: %v", err)
+		// Устанавливаем дедлайн для чтения, чтобы цикл не зависал
+		readErr := udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		if readErr != nil {
 			continue
 		}
 
-		go handleDNSRequest(conn, clientAddr, buf[:n], dnsResolver)
+		n, clientAddr, err := udpConn.ReadFromUDP(buffer)
+
+		if err != nil {
+			// Проверяем, не был ли это таймаут или контекст приложения завершен
+			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+				select {
+				case <-appCtx.Done():
+					log.Println("Контекст приложения завершен, завершаем работу...")
+					return
+				default:
+					continue // Это был таймаут, продолжаем цикл
+				}
+			}
+			log.Printf("Ошибка чтения из UDP: %v", err)
+			continue
+		}
+
+		// Обработка запроса в отдельной горутине, чтобы не блокировать цикл
+		go handleDNSRequest(appCtx, dnsResolver, udpConn, buffer[:n], clientAddr)
 	}
 }
 
-func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte, r *resolver.Resolver) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			log.Printf("Critical Panic in handleDNSRequest for client %s: %v", clientAddr.String(), rec)
-			errorResponse := buildErrorDNSResponse(request, dns.RcodeServerFailure)
-			_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
-			if writeErr != nil {
-				log.Printf("Error: Ошибка отправки ошибки клиенту после паники %s: %v", clientAddr.String(), writeErr)
-			}
-		}
-	}()
-
-	log.Printf("Debug: Получен запрос от %s: %d байт. Начинаем обработку.", clientAddr.String(), len(request))
-
+// handleDNSRequest обрабатывает один DNS-запрос
+func handleDNSRequest(ctx context.Context, r *resolver.Resolver, conn *net.UDPConn, request []byte, clientAddr *net.UDPAddr) {
+	// Создаем контекст с таймаутом для каждого запроса
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	response, err := r.Resolve(ctx, request)
+	response, err := r.Resolve(ctx, request, clientAddr)
 	if err != nil {
 		log.Printf("Error: Ошибка резолвинга запроса от %s: %v", clientAddr.String(), err)
 		rcode := dns.RcodeServerFailure
@@ -109,9 +114,11 @@ func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte
 			rcode = dns.RcodeNameError
 		}
 		errorResponse := buildErrorDNSResponse(request, rcode)
-		_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
-		if writeErr != nil {
-			log.Printf("Error: Ошибка отправки ошибки клиенту %s: %v", clientAddr.String(), writeErr)
+		if errorResponse != nil {
+			_, writeErr := conn.WriteToUDP(errorResponse, clientAddr)
+			if writeErr != nil {
+				log.Printf("Error: Ошибка отправки ошибки клиенту %s: %v", clientAddr.String(), writeErr)
+			}
 		}
 		return
 	}
@@ -125,23 +132,36 @@ func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte
 	}
 }
 
+// buildErrorDNSResponse создает DNS-ответ с ошибкой на основе оригинального запроса
 func buildErrorDNSResponse(originalRequest []byte, rcode int) []byte {
 	msg := new(dns.Msg)
 	err := msg.Unpack(originalRequest)
 	if err != nil {
-		resp := new(dns.Msg)
-		resp.SetRcode(msg, rcode)
-		packed, _ := resp.Pack()
-		return packed
+		// Если не удалось распаковать, создаем простой ответ с ошибкой
+		packedResponse, packErr := (&dns.Msg{
+			MsgHdr: dns.MsgHdr{
+				Id: 0, Rcode: rcode,
+			},
+		}).Pack()
+		if packErr != nil {
+			return nil
+		}
+		return packedResponse
 	}
 
-	resp := new(dns.Msg)
-	resp.SetRcode(msg, rcode)
-	resp.RecursionAvailable = true
-	packed, err := resp.Pack()
-	if err != nil {
-		log.Printf("Error: Ошибка упаковки DNS-ответа с ошибкой: %v", err)
-		return []byte{}
+	response := new(dns.Msg)
+	response.SetRcode(msg, rcode)
+	response.Authoritative = false
+	response.RecursionAvailable = true
+	// Возвращаем вопрос из оригинального запроса
+	if len(msg.Question) > 0 {
+		response.Question = []dns.Question{msg.Question[0]}
 	}
-	return packed
+
+	packedResponse, packErr := response.Pack()
+	if packErr != nil {
+		// Если не удалось упаковать, возвращаем nil
+		return nil
+	}
+	return packedResponse
 }
