@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
 use trust_dns_proto::op::{Message, Query, ResponseCode};
-use trust_dns_proto::rr::{Record, RecordType};
+use trust_dns_proto::rr::{Record, RecordType, Name};
 use trust_dns_proto::serialize::binary::{BinEncodable};
 
 use dashmap::DashMap;
@@ -155,7 +155,8 @@ impl RecursiveResolver {
                 if let Some(cname_record) = response_message.answers().iter().find(|r| r.record_type() == RecordType::CNAME) {
                     if let Some(data) = cname_record.data() {
                         if let Some(cname) = data.as_cname() {
-                            name_to_resolve = cname.name().clone();
+                            // --- ИСПРАВЛЕНО: cname уже является `Name`, у него нет метода `name()`
+                            name_to_resolve = cname.clone();
                         }
                     }
                     query_message = Message::new();
@@ -183,7 +184,8 @@ impl RecursiveResolver {
                         if let Some(glue_record) = response_message.additionals().iter()
                             .find(|r| r.name() == ns_name && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA))
                         {
-                            if let Some(ip) = glue_record.data().and_then(|data| data.as_a().map(|a| a.0)) {
+                            // --- ИСПРАВЛЕНО: .as_a() возвращает &A, а поле 0 содержит Ipv4Addr
+                            if let Some(ip) = glue_record.data().and_then(|data| data.as_a().map(|a| a.0.clone())) {
                                 next_servers.push(SocketAddr::new(IpAddr::V4(ip), 53));
                             }
                         }
@@ -244,7 +246,6 @@ async fn process_dns_query(
 
     QPS_COUNTER.inc();
     
-    // --- ИСПРАВЛЕНО: используем `from_vec` для парсинга ---
     let message = match Message::from_vec(buf) {
         Ok(p) => p,
         Err(_) => return None,
@@ -321,7 +322,6 @@ async fn handle_udp_requests(
                         resolver_clone,
                         rate_limit_map_clone,
                     ).await {
-                        // --- ИСПРАВЛЕНО: `to_bytes` теперь возвращает `Vec<u8>` ---
                         if let Ok(response_buf) = response_msg.to_bytes() {
                             if let Err(e) = udp_sock_clone.send_to(&response_buf, src).await {
                                 eprintln!("Failed to send UDP response: {:?}", e);
