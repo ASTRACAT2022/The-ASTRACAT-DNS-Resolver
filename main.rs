@@ -11,10 +11,11 @@ use tokio::spawn;
 use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use trust_dns_proto::op::{Message, Query, ResponseCode, Header, OpCode, HeaderFlags};
-use trust_dns_proto::rr::{Record, RecordType, RrKey, Name};
-use trust_dns_proto::serialize::binary::{BinEncoder, BinDecoder};
-use trust_dns_proto::xfer::dns_packet::DnsPacket;
+// --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
+use trust_dns_proto::op::{Message, Query, ResponseCode, OpCode};
+use trust_dns_proto::op::header::Header;
+use trust_dns_proto::rr::{Record, RecordType, Name};
+use trust_dns_proto::serialize::binary::{BinEncoder, BinDecodable, BinEncodable};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -100,13 +101,14 @@ impl RecursiveResolver {
     }
 
     /// Рекурсивный резолвинг запроса с параллельными запросами к нескольким NS
-    async fn resolve_iterative(&self, query: Query) -> Result<Message, Box<dyn std::error::Error>> {
+    async fn resolve_iterative(&self, query: &Query) -> Result<Message, Box<dyn std::error::Error>> {
         RECURSIVE_QUERIES_COUNTER.inc();
         
         let mut name_to_resolve = query.name().clone();
         let mut current_servers = self.root_servers.clone();
 
         let mut query_message = Message::new();
+        // --- ИСПРАВЛЕНО: используем `add_query` ---
         query_message.add_query(query.clone());
         query_message.set_recursion_desired(false);
 
@@ -120,7 +122,8 @@ impl RecursiveResolver {
             for server_addr in current_servers.iter() {
                 let sock_clone = Arc::clone(&self.udp_sock);
                 let mut buf = Vec::new();
-                query_message.emit(&mut BinEncoder::new(&mut buf))?;
+                // --- ИСПРАВЛЕНО: используем `to_bytes` вместо `emit` ---
+                query_message.to_bytes(&mut buf)?;
                 let server_addr_clone = server_addr.clone();
 
                 tasks.push(tokio::spawn(async move {
@@ -129,7 +132,7 @@ impl RecursiveResolver {
                     }
                     let mut response_buf = [0; 512];
                     match timeout(Duration::from_secs(5), sock_clone.recv_from(&mut response_buf)).await {
-                        Ok(Ok((len, _))) => Some(DnsPacket::from_bytes(&response_buf[..len])),
+                        Ok(Ok((len, _))) => Some(Message::from_vec(&response_buf[..len]).ok()),
                         _ => None,
                     }
                 }));
@@ -138,8 +141,8 @@ impl RecursiveResolver {
             // Ждем первый успешный ответ
             let mut response_message = None;
             for task in tasks {
-                if let Ok(Some(Ok(packet))) = task.await {
-                    response_message = Some(Message::from_packet(packet));
+                if let Ok(Some(Some(packet))) = task.await {
+                    response_message = Some(packet);
                     break;
                 }
             }
@@ -154,6 +157,8 @@ impl RecursiveResolver {
                 // Если ответ содержит CNAME, нужно его обработать
                 if let Some(cname_record) = response_message.answers().iter().find(|r| r.record_type() == RecordType::CNAME) {
                     name_to_resolve = cname_record.rdata().and_then(|data| data.as_cname().map(|c| c.name().clone())).unwrap();
+                    // --- ИСПРАВЛЕНО: создаем новую Query ---
+                    query_message = Message::new();
                     query_message.add_query(Query::new(name_to_resolve.clone(), query.query_type()));
                     // Начинаем резолвинг CNAME с корней, используя подсказки
                     current_servers = self.root_servers.clone();
@@ -161,7 +166,8 @@ impl RecursiveResolver {
                 }
                 
                 // Упрощенная валидация DNSSEC (проверка флага AD)
-                if response_message.header().flag(HeaderFlags::AUTHENTICATED_DATA) {
+                // --- ИСПРАВЛЕНО: проверка флага AD ---
+                if response_message.header().flags().authenticated_data() {
                     println!("DNSSEC validation successful (AD flag is set) for: {:?}", query.name());
                 } else {
                     println!("DNSSEC validation failed or not supported for: {:?}", query.name());
@@ -240,12 +246,13 @@ async fn process_dns_query(
 
     QPS_COUNTER.inc();
     
-    let packet = match DnsPacket::from_bytes(buf) {
+    // --- ИСПРАВЛЕНО: используем `from_vec` для парсинга ---
+    let message = match Message::from_vec(buf) {
         Ok(p) => p,
         Err(_) => return None,
     };
 
-    let query = match packet.queries().get(0) {
+    let query = match message.queries().get(0) {
         Some(q) => q.clone(),
         None => return None,
     };
@@ -256,7 +263,7 @@ async fn process_dns_query(
             CACHE_HITS_COUNTER.inc();
             println!("Cache hit for: {:?}", query.name());
             let mut response = Message::new();
-            response.set_header(packet.header().clone());
+            response.set_header(message.header().clone());
             response.add_query(query.clone());
             response.add_answers(entry.records.clone());
             response.set_response_code(ResponseCode::NoError);
@@ -266,7 +273,8 @@ async fn process_dns_query(
     
     println!("Cache miss for: {:?}", query.name());
     
-    let response = resolver.resolve_iterative(query.clone()).await.unwrap_or_else(|_| {
+    // --- ИСПРАВЛЕНО: передаем ссылку на Query ---
+    let response = resolver.resolve_iterative(&query).await.unwrap_or_else(|_| {
         let mut error_msg = Message::new();
         error_msg.set_response_code(ResponseCode::ServFail);
         error_msg
@@ -305,6 +313,7 @@ async fn handle_udp_requests(
             Ok((len, src)) => {
                 let cache_clone = Arc::clone(&cache);
                 let resolver_clone = Arc::clone(&resolver);
+                let udp_sock_clone = Arc::clone(&sock);
                 let rate_limit_map_clone = Arc::clone(&rate_limit_map);
                 
                 tokio::spawn(async move {
@@ -316,8 +325,9 @@ async fn handle_udp_requests(
                         rate_limit_map_clone,
                     ).await {
                         let mut response_buf = Vec::new();
-                        if let Ok(_) = response_msg.emit(&mut BinEncoder::new(&mut response_buf)) {
-                            if let Err(e) = sock.send_to(&response_buf, src).await {
+                        // --- ИСПРАВЛЕНО: используем `to_bytes` вместо `emit` ---
+                        if let Ok(_) = response_msg.to_bytes(&mut response_buf) {
+                            if let Err(e) = udp_sock_clone.send_to(&response_buf, src).await {
                                 eprintln!("Failed to send UDP response: {:?}", e);
                             }
                         }
@@ -329,14 +339,21 @@ async fn handle_udp_requests(
     }
 }
 
+// --- ИСПРАВЛЕНО: функция теперь возвращает `()` и обрабатывает ошибки внутри ---
 async fn handle_tcp_requests(
     listener: TcpListener,
     cache: Arc<DnsCache>,
     resolver: Arc<RecursiveResolver>,
     rate_limit_map: Arc<RateLimitMap>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     loop {
-        let (mut stream, addr) = listener.accept().await?;
+        let (mut stream, addr) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to accept TCP connection: {}", e);
+                continue;
+            }
+        };
         let cache_clone = Arc::clone(&cache);
         let resolver_clone = Arc::clone(&resolver);
         let rate_limit_map_clone = Arc::clone(&rate_limit_map);
@@ -359,9 +376,9 @@ async fn handle_tcp_requests(
                     rate_limit_map_clone,
                 ).await {
                     let mut response_buf = Vec::new();
-                    let mut encoder = BinEncoder::new(&mut response_buf);
                     
-                    if let Ok(_) = response_msg.emit(&mut encoder) {
+                    // --- ИСПРАВЛЕНО: используем `to_bytes` вместо `emit` ---
+                    if let Ok(_) = response_msg.to_bytes(&mut response_buf) {
                         let len_prefix = (response_buf.len() as u16).to_be_bytes();
                         if let Err(e) = stream.write_all(&len_prefix).await {
                             eprintln!("Failed to send TCP length prefix: {:?}", e);
@@ -454,6 +471,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_clone = Arc::clone(&cache);
     let resolver_clone = Arc::clone(&resolver);
     let rate_limit_map_clone = Arc::clone(&rate_limit_map);
+    // --- ИСПРАВЛЕНО: `spawn` теперь работает, так как `handle_tcp_requests` не возвращает `Result` ---
     spawn(handle_tcp_requests(tcp_listener, cache_clone, resolver_clone, rate_limit_map_clone));
 
     println!("ASTRACAT DNS Resolver is ready to serve requests.");
