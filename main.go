@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ASTRACAT2022/TheASTRACAT_DNS_Resolver/resolver"
+	"./resolver"
 	"github.com/miekg/dns"
 )
 
