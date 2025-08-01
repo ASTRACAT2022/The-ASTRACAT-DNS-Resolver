@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // --- ИСПРАВЛЕННЫЕ ИМПОРТЫ ---
 use trust_dns_proto::op::{Message, Query, ResponseCode};
-use trust_dns_proto::rr::{Record, RecordType, Name};
+use trust_dns_proto::rr::{Record, RecordType};
 use trust_dns_proto::serialize::binary::{BinEncodable};
 
 use dashmap::DashMap;
@@ -155,7 +155,6 @@ impl RecursiveResolver {
                 if let Some(cname_record) = response_message.answers().iter().find(|r| r.record_type() == RecordType::CNAME) {
                     if let Some(data) = cname_record.data() {
                         if let Some(cname) = data.as_cname() {
-                            // --- ИСПРАВЛЕНО: cname уже является `Name`, у него нет метода `name()`
                             name_to_resolve = cname.clone();
                         }
                     }
@@ -184,9 +183,9 @@ impl RecursiveResolver {
                         if let Some(glue_record) = response_message.additionals().iter()
                             .find(|r| r.name() == ns_name && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA))
                         {
-                            // --- ИСПРАВЛЕНО: .as_a() возвращает &A, а поле 0 содержит Ipv4Addr
-                            if let Some(ip) = glue_record.data().and_then(|data| data.as_a().map(|a| a.0.clone())) {
-                                next_servers.push(SocketAddr::new(IpAddr::V4(ip), 53));
+                            // --- ИСПРАВЛЕНО: .as_a() возвращает &Ipv4Addr, мы просто его клонируем
+                            if let Some(ip) = glue_record.data().and_then(|data| data.as_a()) {
+                                next_servers.push(SocketAddr::new(IpAddr::V4(ip.clone()), 53));
                             }
                         }
                     }
