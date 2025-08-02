@@ -8,5 +8,12 @@ tokio = { version = "1.37.0", features = ["full"] }
 anyhow = "1.0.82"
 hickory-proto = { version = "0.26.0-alpha.1" }
 rand = "0.8.5"
-env_logger = "0.11.3"
-dashmap = "5.5"
+env_logger = "0.11.8"
+dashmap = "5.5.3"
+log = "0.4"
+futures = "0.3.30"
+tokio-util = { version = "0.7", features = ["full"] }
+
+
+
+
