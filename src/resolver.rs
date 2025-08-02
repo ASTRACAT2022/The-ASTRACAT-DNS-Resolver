@@ -17,6 +17,7 @@ use rand::random;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use dashmap::DashMap;
+use log::{info, error, trace, warn};
 
 use crate::cache::{Cache, CacheEntry};
 
@@ -29,7 +30,7 @@ const DNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Порог TTL для предварительной выборки (обновления кэша).
 const PREFETCH_THRESHOLD: Duration = Duration::from_secs(60);
 /// Максимальное время ожидания сигнала "heartbeat" от сервера.
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30); // 30 seconds
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Список корневых DNS-серверов.
 const ROOT_SERVERS: &[IpAddr] = &[
@@ -68,7 +69,7 @@ pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: Cancella
     let sock = Arc::new(UdpSocket::bind(bind_addr).await.context("Не удалось привязать UDP-сокет")?);
     let cache: Cache = Arc::new(DashMap::new());
 
-    println!("Listening on {}", bind_addr);
+    info!("Listening on {}", bind_addr);
 
     let cache_clone_prefetch = Arc::clone(&cache);
     let shutdown_token_prefetch = shutdown_token.clone(); // Клонируем токен для задачи предвыборки
@@ -78,11 +79,12 @@ pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: Cancella
         loop {
             // Проверяем сигнал завершения.
             if shutdown_token_prefetch.is_cancelled() {
-                println!("Задача предварительной выборки получила сигнал завершения. Выход...");
+                info!("Задача предварительной выборки получила сигнал завершения. Выход...");
                 return;
             }
 
             let now = Instant::now();
+            // Удаляем истекшие записи
             cache_clone_prefetch.retain(|_, v| v.expires_at > now);
 
             for entry in cache_clone_prefetch.iter() {
@@ -91,16 +93,23 @@ pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: Cancella
                         let key = entry.key().clone();
                         let name_str = key.0.clone();
                         let record_type = key.1;
+                        let name_for_log = name_str.clone();
+
                         let name_owned = name_str.parse().unwrap_or_else(|_| {
+                            error!("Не удалось разобрать имя из кэша для предварительной выборки: {}", name_str);
                             hickory_proto::rr::Name::from_ascii(".").unwrap()
                         });
-                        
+
+                        info!("Предварительная выборка истекающей записи для '{}' (тип {})", name_for_log, record_type);
+
                         let cache_clone_inner = Arc::clone(&cache_clone_prefetch);
                         tokio::spawn(async move {
-                            if let Ok((answers, _)) = recursive_lookup_with_cache(name_owned, record_type, cache_clone_inner.clone(), 0).await {
-                                if let Some(min_ttl) = answers.iter().map(|r| r.ttl()).min() {
+                            if let Ok((answers, _)) = recursive_lookup_with_cache(name_owned, record_type, &cache_clone_inner, 0).await {
+                                if !answers.is_empty() {
+                                    let min_ttl = answers.iter().map(|r| r.ttl()).min().unwrap_or(0);
                                     let expires_at = Instant::now() + Duration::from_secs(min_ttl.into());
-                                    cache_clone_inner.insert((name_str.clone(), record_type), CacheEntry { records: answers.clone(), expires_at });
+                                    cache_clone_inner.insert((name_str.clone(), record_type), CacheEntry { records: answers, expires_at });
+                                    info!("Кэш успешно обновлен для '{}'", name_str);
                                 }
                             }
                         });
@@ -113,63 +122,58 @@ pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: Cancella
 
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     loop {
-        tokio::select! {
-            _ = shutdown_token.cancelled() => {
-                println!("Задача сервера получила сигнал завершения. Выход...");
-                return Ok(());
-            },
-            recv_result = sock.recv_from(&mut buf) => {
-                let (len, addr) = match recv_result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        eprintln!("Ошибка получения данных из сокета: {}. Продолжение...", e);
-                        continue;
-                    }
-                };
-
+        let (len, addr) = tokio::select! {
+            result = sock.recv_from(&mut buf) => result.context("Не удалось получить данные из сокета"),
+            _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT / 2)) => {
+                // Отправляем сигнал "heartbeat" даже если активности нет, чтобы монитор знал, что мы живы.
                 let _ = heartbeat_tx.try_send(());
+                trace!("No activity, sending heartbeat...");
+                continue;
+            }
+        }?;
+        
+        let _ = heartbeat_tx.try_send(());
 
-                let sock_clone = Arc::clone(&sock);
-                let cache_clone = Arc::clone(&cache);
-                let request_bytes_owned = buf[..len].to_vec();
+        let sock_clone = Arc::clone(&sock);
+        let cache_clone = Arc::clone(&cache);
+        let request_bytes_owned = buf[..len].to_vec();
         
-                // Запускаем задачу для обработки каждого запроса.
-                tokio::spawn(async move {
-                    match handle_query(&request_bytes_owned, &cache_clone).await {
-                        Ok(response_message) => {
-                            let mut response_bytes = Vec::new();
-                            let mut encoder = BinEncoder::new(&mut response_bytes);
-                            if response_message.emit(&mut encoder).is_ok() {
-                                if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
-                                    eprintln!("Не удалось отправить ответ на {}: {}", addr, e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Ошибка обработки запроса от {}: {}", addr, e);
-                            if let Ok(request_message) = Message::read(&request_bytes_owned) {
-                                let failure_message = Message::error_msg(
-                                    request_message.header().id(),
-                                    request_message.op_code(),
-                                    ResponseCode::ServFail,
-                                );
-        
-                                let mut response_bytes = Vec::new();
-                                let mut encoder = BinEncoder::new(&mut response_bytes);
-                                if failure_message.emit(&mut encoder).is_ok() {
-                                    if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
-                                        eprintln!("Не удалось отправить ответ об ошибке на {}: {}", addr, e);
-                                    }
-                                }
-                            }
+        // Запускаем задачу для обработки каждого запроса.
+        tokio::spawn(async move {
+            match handle_query(&request_bytes_owned, &cache_clone).await {
+                Ok(response_message) => {
+                    let mut response_bytes = Vec::new();
+                    let mut encoder = BinEncoder::new(&mut response_bytes);
+                    if let Ok(_) = response_message.emit(&mut encoder) {
+                        if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
+                            error!("Не удалось отправить ответ на {}: {}", addr, e);
                         }
                     }
-                });
+                },
+                Err(e) => {
+                    error!("Ошибка обработки запроса от {}: {}", addr, e);
+                    if let Ok(request_message) = Message::read(&request_bytes_owned) {
+                        let failure_message = Message::error_msg(
+                            request_message.header().id(),
+                            request_message.op_code(),
+                            ResponseCode::ServFail,
+                        );
+        
+                        let mut response_bytes = Vec::new();
+                        let mut encoder = BinEncoder::new(&mut response_bytes);
+                        if let Ok(_) = failure_message.emit(&mut encoder) {
+                            if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
+                                error!("Не удалось отправить ответ об ошибке на {}: {}", addr, e);
+                            }
+                        }
+                    } else {
+                        error!("Не удалось разобрать исходный запрос для отправки ответа об ошибке: {}", e);
+                    }
+                }
             }
-        }
+        });
     }
 }
-
 
 /// Обрабатывает один входящий DNS-запрос.
 async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
@@ -178,6 +182,7 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
 
     let questions = request_message.queries();
     if questions.is_empty() {
+        warn!("Получен DNS-запрос без вопросов.");
         let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
         response_message.set_recursion_available(true);
         return Ok(response_message);
@@ -185,9 +190,12 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
 
     let query = questions[0].clone();
 
+    info!("Получен запрос для '{}' (тип {})", query.name(), query.query_type());
+
     let cache_key = (query.name().to_string(), query.query_type());
     if let Some(entry) = cache.get(&cache_key) {
         if entry.expires_at > Instant::now() {
+            info!("Попадание в кэш для '{}'", query.name());
             let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
             response_message.set_recursion_available(true);
             response_message.add_query(query);
@@ -197,10 +205,11 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
             return Ok(response_message);
         } else {
             cache.remove(&cache_key);
+            info!("Запись в кэше для '{}' истекла", query.name());
         }
     }
 
-    let (answers, authorities) = recursive_lookup_with_cache(query.name().clone(), query.query_type(), Arc::clone(&cache), 0)
+    let (answers, authorities) = recursive_lookup_with_cache(query.name().clone(), query.query_type(), cache, 0)
         .await.context("Рекурсивный поиск не удался")?;
 
     let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
@@ -215,6 +224,8 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
         response_message.add_name_server(record);
     }
 
+    info!("Успешно разрешен '{}' с {} ответами", query.name(), response_message.answers().len());
+
     Ok(response_message)
 }
 
@@ -223,11 +234,12 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
 fn recursive_lookup_with_cache(
     name: hickory_proto::rr::Name,
     record_type: RecordType,
-    cache: Cache,
+    cache: &Cache,
     depth: u8,
 ) -> Pin<Box<dyn Future<Output = Result<(Vec<Record>, Vec<Record>)>> + Send + 'static>> {
     Box::pin(async move {
         if depth > 10 {
+            error!("Достигнута максимальная глубина рекурсии для '{}'", name);
             return Ok((vec![], vec![]));
         }
 
@@ -250,12 +262,20 @@ fn recursive_lookup_with_cache(
             let mut futures = Vec::new();
             for server_ip in &current_servers {
                 let server_addr = SocketAddr::new(*server_ip, 53);
-                futures.push(send_udp_query(&request_bytes, server_addr));
+                futures.push(send_udp_query(&request_bytes, &server_addr));
             }
 
             let mut successful_response = None;
-            for fut in futures {
-                if let Ok(bytes) = fut.await {
+            while !futures.is_empty() {
+                let response_result = tokio::select! {
+                    res = futures.remove(0) => res,
+                    _ = tokio::time::sleep(DNS_REQUEST_TIMEOUT) => {
+                        warn!("Таймаут ожидания ответа.");
+                        continue;
+                    },
+                };
+                
+                if let Ok(bytes) = response_result {
                     let mut decoder = BinDecoder::new(&bytes);
                     if let Ok(message) = Message::read(&mut decoder) {
                         successful_response = Some(message);
@@ -280,7 +300,8 @@ fn recursive_lookup_with_cache(
 
             if let Some(rec) = response.answers().iter().find(|rec| rec.record_type() == RecordType::CNAME) {
                 if let RData::CNAME(cname_name_record) = rec.data() {
-                    return recursive_lookup_with_cache(cname_name_record.0.clone(), record_type, cache.clone(), depth + 1).await;
+                    info!("Получен CNAME для '{}', рекурсия с '{}'", name, cname_name_record.0);
+                    return recursive_lookup_with_cache(cname_name_record.0.clone(), record_type, cache, depth + 1).await;
                 }
             }
 
@@ -302,15 +323,16 @@ fn recursive_lookup_with_cache(
                 }
 
                 if new_servers.is_empty() {
+                    info!("Клеящие записи не найдены, выполняем новые запросы для NS-серверов.");
                     for ns_name in &ns_names {
-                        if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::A, cache.clone(), depth + 1).await {
+                        if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::A, cache, depth + 1).await {
                             for answer in answers {
                                 if let Some(ip) = extract_ip_from_rdata(answer.data()) {
                                     new_servers.push(ip);
                                 }
                             }
                         }
-                        if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::AAAA, cache.clone(), depth + 1).await {
+                        if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::AAAA, cache, depth + 1).await {
                             for answer in answers {
                                 if let Some(ip) = extract_ip_from_rdata(answer.data()) {
                                     new_servers.push(ip);
@@ -321,10 +343,12 @@ fn recursive_lookup_with_cache(
                 }
 
                 if new_servers.is_empty() {
+                    warn!("Не удалось найти IP-адреса для новых серверов имен, прекращение рекурсии.");
                     return Ok((vec![], response.name_servers().to_vec()));
                 }
 
                 current_servers = new_servers;
+                info!("Следуем по перенаправлению на новые серверы: {:?}", current_servers);
             } else {
                 return Ok((vec![], response.name_servers().to_vec()));
             }
@@ -333,14 +357,14 @@ fn recursive_lookup_with_cache(
 }
 
 /// Отправляет UDP DNS-запрос и ожидает ответа с таймаутом.
-async fn send_udp_query(request_bytes: &[u8], server_addr: SocketAddr) -> Result<Vec<u8>, anyhow::Error> {
+async fn send_udp_query(request_bytes: &[u8], server_addr: &SocketAddr) -> Result<Vec<u8>, anyhow::Error> {
     let bind_addr = match server_addr.ip() {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
     
     let socket = UdpSocket::bind(bind_addr).await?;
-    tokio::time::timeout(DNS_REQUEST_TIMEOUT, socket.send_to(request_bytes, &server_addr)).await??;
+    tokio::time::timeout(DNS_REQUEST_TIMEOUT, socket.send_to(request_bytes, server_addr)).await??;
 
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     let (len, _) = tokio::time::timeout(DNS_REQUEST_TIMEOUT, socket.recv_from(&mut buf)).await??;
