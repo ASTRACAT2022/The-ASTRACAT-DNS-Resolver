@@ -1,7 +1,8 @@
 // main.rs
-// ASTRACAT DNS Resolver - V4
-// This version adds full IPv6 support, in addition to being silent and highly concurrent.
-// It is explicitly configured for high concurrency using Tokio's multi-threaded runtime.
+// ASTRACAT DNS Resolver - V7
+// This version introduces a more robust recovery mechanism by ensuring the main
+// loop acts as a supervisor, gracefully handling and recovering from potential
+// panics or unhandled errors in the server's core logic.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -27,9 +28,10 @@ const DNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// The TTL threshold for triggering a prefetch (cache refresh).
 /// If a record's remaining TTL drops below this value, a new lookup is initiated.
 const PREFETCH_THRESHOLD: Duration = Duration::from_secs(60);
+/// The duration after which the server's main loop will restart.
+const RESTART_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
 
 /// The list of root DNS servers, including both IPv4 and IPv6 addresses.
-/// This allows the resolver to start its recursive lookup with either protocol.
 const ROOT_SERVERS: &[IpAddr] = &[
     IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)),       // a.root-servers.net (IPv4)
     IpAddr::V6(Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 0, 0x2)), // a.root-servers.net (IPv6)
@@ -66,28 +68,43 @@ struct CacheEntry {
 }
 
 /// The main cache, implemented as a thread-safe `DashMap` for concurrent access.
-/// The key is a tuple of the domain name and record type.
 type Cache = Arc<DashMap<(String, RecordType), CacheEntry>>;
 
-// We configure Tokio for a multi-threaded runtime. This is key to achieving
-// high concurrency and processing a large number of requests simultaneously.
-// The default number of worker threads is the number of CPU cores, which is
-// a good starting point for high-performance applications.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    println!("Starting ASTRACAT DNS resolver on 0.0.0.0:{} (dual-stack)", DNS_PORT);
+    // This loop acts as a supervisor for the server logic.
+    loop {
+        println!("Starting ASTRACAT DNS resolver on 0.0.0.0:{} (dual-stack)", DNS_PORT);
+        
+        let server_future = run_server();
+        
+        let result = tokio::select! {
+            // Wait for the server to finish (either successfully or with an error)
+            server_result = server_future => server_result,
+            // Or wait for the restart timer to expire
+            _ = tokio::time::sleep(RESTART_INTERVAL) => {
+                println!("Scheduled restart initiated. Shutting down and restarting the server...");
+                Ok(())
+            }
+        };
 
-    // The socket is bound to the IPv6 unspecified address, `[::]`, which on most modern
-    // operating systems will listen for both IPv4 and IPv6 connections. This is
-    // the core of the dual-stack support.
+        if let Err(e) = result {
+            eprintln!("ASTRACAT DNS resolver encountered a fatal error: {}", e);
+        }
+        
+        println!("Restarting server in 1 second...");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The main server logic, now extracted into its own function.
+async fn run_server() -> Result<()> {
     let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DNS_PORT);
-    
     let sock = Arc::new(UdpSocket::bind(bind_addr).await.context("Failed to bind UDP socket")?);
     let cache: Cache = Arc::new(DashMap::new());
 
     println!("Listening on {}", bind_addr);
 
-    // Spawn a background task for cache cleanup and prefetching.
     let cache_clone_prefetch = Arc::clone(&cache);
     tokio::spawn(async move {
         loop {
@@ -122,12 +139,14 @@ async fn main() -> Result<()> {
 
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     loop {
-        let (len, addr) = tokio::select! {
-            result = sock.recv_from(&mut buf) => result.context("Failed to receive from socket"),
-            _ = tokio::time::sleep(Duration::from_secs(60)) => {
+        // We handle potential errors from recv_from() and continue the loop instead of crashing
+        let (len, addr) = match sock.recv_from(&mut buf).await {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("Error receiving from socket: {}. Continuing...", e);
                 continue;
             }
-        }?;
+        };
 
         let sock_clone = Arc::clone(&sock);
         let cache_clone = Arc::clone(&cache);
@@ -226,7 +245,6 @@ fn recursive_lookup_with_cache(
             return Ok((vec![], vec![]));
         }
 
-        // The list of current servers can now contain both IPv4 and IPv6 addresses.
         let mut current_servers: Vec<IpAddr> = ROOT_SERVERS.to_vec();
 
         loop {
@@ -299,7 +317,6 @@ fn recursive_lookup_with_cache(
 
                 if new_servers.is_empty() {
                     for ns_name in &ns_names {
-                        // Recursively look up both A and AAAA records for the NS server.
                         if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::A, cache.clone(), depth + 1).await {
                             for answer in answers {
                                 if let Some(ip) = extract_ip_from_rdata(answer.data()) {
@@ -331,8 +348,6 @@ fn recursive_lookup_with_cache(
 
 /// Sends a UDP DNS query and waits for a response with a timeout.
 async fn send_udp_query(request_bytes: &[u8], server_addr: SocketAddr) -> Result<Vec<u8>, anyhow::Error> {
-    // We bind to the unspecified address of the same IP family as the server address.
-    // This allows the socket to correctly communicate with both IPv4 and IPv6 servers.
     let bind_addr = match server_addr.ip() {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
