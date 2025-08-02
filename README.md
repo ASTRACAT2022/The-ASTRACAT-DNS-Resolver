@@ -38,7 +38,7 @@ ASTRACAT DNS-резолвер 🚀
 
     Клонирование репозитория:
 
-    git clone https://github.com/ваш_репозиторий/The-ASTRACAT-DNS-Resolver.git
+    git clone https://github.com/ASTRACAT2022/The-ASTRACAT-DNS-Resolver.git
     cd The-ASTRACAT-DNS-Resolver
 
     Сборка проекта:
