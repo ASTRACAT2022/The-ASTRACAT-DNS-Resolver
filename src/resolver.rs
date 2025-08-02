@@ -1,115 +1,107 @@
-// src/resolver.rs
-// Модуль для обработки DNS-запросов и рекурсивного разрешения.
+// Run the server with: RUST_LOG=info cargo run
+// Ensure your Cargo.toml file is updated with the dependencies from the previous step.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use std::time::{Duration, Instant};
 use std::io;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
+use log::{info, error, trace, warn};
 use hickory_proto::op::{Message, ResponseCode, Query};
 use hickory_proto::rr::{Record, RecordType, RData};
 use hickory_proto::serialize::binary::{BinEncoder, BinDecoder, BinEncodable, BinDecodable};
 use anyhow::{Result, Context};
 use rand::random;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use dashmap::DashMap;
-use log::{info, error, trace, warn};
 
-use crate::cache::{Cache, CacheEntry};
-
-/// Максимальный размер UDP-пакета для DNS-сообщений.
+/// Maximum UDP payload size for DNS
 const MAX_UDP_PAYLOAD_SIZE: usize = 512;
-/// Порт для DNS-сервера.
+/// The DNS port to listen on
 const DNS_PORT: u16 = 5353;
-/// Таймаут для DNS-запроса к внешнему серверу.
+/// Timeout for each DNS request
 const DNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// Порог TTL для предварительной выборки (обновления кэша).
+/// Minimum remaining TTL to trigger prefetching
 const PREFETCH_THRESHOLD: Duration = Duration::from_secs(60);
-/// Максимальное время ожидания сигнала "heartbeat" от сервера.
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Список корневых DNS-серверов.
-const ROOT_SERVERS: &[IpAddr] = &[
-    IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)),       // a.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x503, 0xba3e, 0, 0, 0, 0, 0x2)), // a.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(199, 9, 14, 201)),      // b.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x200, 0, 0, 0, 0, 0xb)), // b.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(192, 33, 4, 12)),       // c.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x2e, 0, 0, 0, 0, 0x2)), // c.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(199, 7, 91, 13)),       // d.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x2d, 0, 0, 0, 0, 0xd)), // d.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(192, 203, 230, 10)),    // e.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0xa8, 0, 0, 0, 0, 0x2)), // e.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(192, 5, 5, 241)),       // f.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x2f, 0, 0, 0, 0, 0xf)), // f.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(192, 112, 36, 4)),      // g.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x12, 0, 0, 0, 0, 0xd0d)), // g.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(198, 97, 190, 53)),     // h.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x1, 0, 0, 0, 0, 0x53)), // h.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(192, 36, 148, 17)),     // i.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x7fe, 0, 0, 0, 0, 0, 0x33)), // i.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(192, 58, 128, 30)),     // j.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x503, 0xc27, 0, 0, 0, 0, 0x2)), // j.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(193, 0, 14, 129)),      // k.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x7fd, 0, 0, 0, 0, 0, 0x1)), // k.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(199, 7, 83, 42)),       // l.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0x500, 0x9f, 0, 0, 0, 0, 0x42)), // l.root-servers.net (IPv6)
-    IpAddr::V4(Ipv4Addr::new(202, 12, 27, 33)),      // m.root-servers.net (IPv4)
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdc3, 0, 0, 0, 0, 0, 0x35)), // m.root-servers.net (IPv6)
+// Root DNS servers
+const ROOT_SERVERS: &[Ipv4Addr] = &[
+    Ipv4Addr::new(198, 41, 0, 4), // a.root-servers.net
+    Ipv4Addr::new(199, 9, 14, 201), // b.root-servers.net
+    Ipv4Addr::new(192, 33, 4, 12), // c.root-servers.net
+    Ipv4Addr::new(199, 7, 91, 13), // d.root-servers.net
+    Ipv4Addr::new(192, 203, 230, 10), // e.root-servers.net
+    Ipv4Addr::new(192, 5, 5, 241), // f.root-servers.net
+    Ipv4Addr::new(192, 112, 36, 4), // g.root-servers.net
+    Ipv4Addr::new(198, 97, 190, 53), // h.root-servers.net
+    Ipv4Addr::new(192, 36, 148, 17), // i.root-servers.net
+    Ipv4Addr::new(192, 58, 128, 30), // j.root-servers.net
+    Ipv4Addr::new(193, 0, 14, 129), // k.root-servers.net
+    Ipv4Addr::new(199, 7, 83, 42), // l.root-servers.net
+    Ipv4Addr::new(202, 12, 27, 33), // m.root-servers.net
 ];
 
+// Cache entry with records and an expiration time
+struct CacheEntry {
+    records: Vec<Record>,
+    expires_at: Instant,
+}
 
-/// Основная логика сервера, вынесенная в отдельную функцию.
-pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: CancellationToken) -> Result<()> {
-    let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DNS_PORT);
-    let sock = Arc::new(UdpSocket::bind(bind_addr).await.context("Не удалось привязать UDP-сокет")?);
+// Cache for DNS responses using a thread-safe DashMap
+type Cache = Arc<DashMap<(String, RecordType), CacheEntry>>;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging
+    env_logger::init();
+    
+    info!("Starting DNS resolver on 0.0.0.0:{}", DNS_PORT);
+
+    // Create a UDP socket and a shared cache
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT);
+    let sock = Arc::new(UdpSocket::bind(bind_addr).await
+        .with_context(|| format!("Failed to bind to {}", bind_addr))?);
     let cache: Cache = Arc::new(DashMap::new());
 
     info!("Listening on {}", bind_addr);
 
+    // Start a background task for cache cleanup and prefetching
     let cache_clone_prefetch = Arc::clone(&cache);
-    let shutdown_token_prefetch = shutdown_token.clone(); // Клонируем токен для задачи предвыборки
-
-    // Задача для фоновой предварительной выборки и очистки кэша.
     tokio::spawn(async move {
         loop {
-            // Проверяем сигнал завершения.
-            if shutdown_token_prefetch.is_cancelled() {
-                info!("Задача предварительной выборки получила сигнал завершения. Выход...");
-                return;
-            }
-
+            // Retain entries that have not expired
             let now = Instant::now();
-            // Удаляем истекшие записи
             cache_clone_prefetch.retain(|_, v| v.expires_at > now);
 
+            // Iterate through the cache to prefetch expiring records
             for entry in cache_clone_prefetch.iter() {
                 if let Some(time_left) = entry.expires_at.checked_duration_since(now) {
                     if time_left < PREFETCH_THRESHOLD {
+                        // Clone the key data to move into the async task
                         let key = entry.key().clone();
-                        let name_str = key.0.clone();
+                        let name_str = key.0;
                         let record_type = key.1;
-                        let name_for_log = name_str.clone();
 
                         let name_owned = name_str.parse().unwrap_or_else(|_| {
-                            error!("Не удалось разобрать имя из кэша для предварительной выборки: {}", name_str);
-                            hickory_proto::rr::Name::from_ascii(".").unwrap()
+                            error!("Failed to parse name from cache for prefetch: {}", name_str);
+                            return hickory_proto::rr::Name::from_ascii(".").unwrap();
                         });
-
-                        info!("Предварительная выборка истекающей записи для '{}' (тип {})", name_for_log, record_type);
-
+                        
+                        let name_for_log = name_str.clone(); // Clone for use in the log message
+                        info!("Prefetching expiring record for '{}' (type {})", name_for_log, record_type);
+                        
                         let cache_clone_inner = Arc::clone(&cache_clone_prefetch);
                         tokio::spawn(async move {
-                            if let Ok((answers, _)) = recursive_lookup_with_cache(name_owned, record_type, &cache_clone_inner, 0).await {
+                            // Pass the Arc by value to the recursive lookup function.
+                            if let Ok((answers, _)) = recursive_lookup_with_cache(name_owned, record_type, cache_clone_inner.clone(), 0).await {
                                 if !answers.is_empty() {
                                     let min_ttl = answers.iter().map(|r| r.ttl()).min().unwrap_or(0);
                                     let expires_at = Instant::now() + Duration::from_secs(min_ttl.into());
+                                    // Use the cloned name_str and record_type
                                     cache_clone_inner.insert((name_str.clone(), record_type), CacheEntry { records: answers, expires_at });
-                                    info!("Кэш успешно обновлен для '{}'", name_str);
+                                    info!("Successfully prefetched and updated cache for '{}'", name_str);
                                 }
                             }
                         });
@@ -120,54 +112,54 @@ pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: Cancella
         }
     });
 
+    // Main server loop to handle incoming requests
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     loop {
         let (len, addr) = tokio::select! {
-            result = sock.recv_from(&mut buf) => result.context("Не удалось получить данные из сокета"),
-            _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT / 2)) => {
-                // Отправляем сигнал "heartbeat" даже если активности нет, чтобы монитор знал, что мы живы.
-                let _ = heartbeat_tx.try_send(());
-                trace!("No activity, sending heartbeat...");
+            result = sock.recv_from(&mut buf) => result.context("Failed to receive from socket"),
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                trace!("No activity, sleeping...");
                 continue;
             }
         }?;
         
-        let _ = heartbeat_tx.try_send(());
-
         let sock_clone = Arc::clone(&sock);
         let cache_clone = Arc::clone(&cache);
         let request_bytes_owned = buf[..len].to_vec();
         
-        // Запускаем задачу для обработки каждого запроса.
+        // Spawn a task to handle each query asynchronously
         tokio::spawn(async move {
             match handle_query(&request_bytes_owned, &cache_clone).await {
                 Ok(response_message) => {
                     let mut response_bytes = Vec::new();
                     let mut encoder = BinEncoder::new(&mut response_bytes);
+                    
                     if let Ok(_) = response_message.emit(&mut encoder) {
                         if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
-                            error!("Не удалось отправить ответ на {}: {}", addr, e);
+                            error!("Failed to send response to {}: {}", addr, e);
                         }
                     }
                 },
                 Err(e) => {
-                    error!("Ошибка обработки запроса от {}: {}", addr, e);
-                    if let Ok(request_message) = Message::read(&request_bytes_owned) {
+                    error!("Error handling query from {}: {}", addr, e);
+                    // Create an error response message
+                    if let Ok(request_message) = Message::from_vec(&request_bytes_owned) {
                         let failure_message = Message::error_msg(
                             request_message.header().id(),
                             request_message.op_code(),
                             ResponseCode::ServFail,
                         );
-        
+                        
                         let mut response_bytes = Vec::new();
                         let mut encoder = BinEncoder::new(&mut response_bytes);
+                        
                         if let Ok(_) = failure_message.emit(&mut encoder) {
                             if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
-                                error!("Не удалось отправить ответ об ошибке на {}: {}", addr, e);
+                                error!("Failed to send error response to {}: {}", addr, e);
                             }
                         }
                     } else {
-                        error!("Не удалось разобрать исходный запрос для отправки ответа об ошибке: {}", e);
+                        error!("Failed to parse original request for error response: {}", e);
                     }
                 }
             }
@@ -175,27 +167,30 @@ pub async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: Cancella
     }
 }
 
-/// Обрабатывает один входящий DNS-запрос.
+/// Asynchronously handles a single DNS query.
 async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
     let mut decoder = BinDecoder::new(request_bytes);
-    let request_message = Message::read(&mut decoder).context("Не удалось декодировать DNS-запрос")?;
+    let request_message = Message::read(&mut decoder)
+        .context("Failed to decode DNS request message")?;
 
     let questions = request_message.queries();
     if questions.is_empty() {
-        warn!("Получен DNS-запрос без вопросов.");
+        warn!("Received a DNS request with no questions.");
+        // Use the correct constructor for a response message
         let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
         response_message.set_recursion_available(true);
         return Ok(response_message);
     }
-
+    
     let query = questions[0].clone();
+    
+    info!("Received a query for '{}' (type {})", query.name(), query.query_type());
 
-    info!("Получен запрос для '{}' (тип {})", query.name(), query.query_type());
-
+    // Check the cache first
     let cache_key = (query.name().to_string(), query.query_type());
     if let Some(entry) = cache.get(&cache_key) {
         if entry.expires_at > Instant::now() {
-            info!("Попадание в кэш для '{}'", query.name());
+            info!("Cache hit for '{}'", query.name());
             let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
             response_message.set_recursion_available(true);
             response_message.add_query(query);
@@ -205,64 +200,71 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
             return Ok(response_message);
         } else {
             cache.remove(&cache_key);
-            info!("Запись в кэше для '{}' истекла", query.name());
+            info!("Cache entry for '{}' expired", query.name());
         }
     }
+    
+    // Perform recursive lookup
+    let (answers, authorities) = recursive_lookup_with_cache(query.name().clone(), query.query_type(), Arc::clone(&cache), 0).await
+        .context("Recursive lookup failed")?;
 
-    let (answers, authorities) = recursive_lookup_with_cache(query.name().clone(), query.query_type(), cache, 0)
-        .await.context("Рекурсивный поиск не удался")?;
-
+    // Build the response message
     let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
     response_message.set_recursion_available(true);
+    
     for q in request_message.queries() {
         response_message.add_query(q.clone());
     }
+
     for record in answers {
         response_message.add_answer(record);
     }
+    
     for record in authorities {
         response_message.add_name_server(record);
     }
-
-    info!("Успешно разрешен '{}' с {} ответами", query.name(), response_message.answers().len());
-
+    
+    info!("Successfully resolved '{}' with {} answers", query.name(), response_message.answers().len());
+    
     Ok(response_message)
 }
 
-
-/// Рекурсивно выполняет DNS-запрос, начиная с корневых серверов.
+/// Performs a manual recursive DNS lookup starting from root servers.
 fn recursive_lookup_with_cache(
     name: hickory_proto::rr::Name,
     record_type: RecordType,
-    cache: &Cache,
+    // Pass the Cache Arc by value to enable a 'static lifetime for the future.
+    cache: Cache,
     depth: u8,
 ) -> Pin<Box<dyn Future<Output = Result<(Vec<Record>, Vec<Record>)>> + Send + 'static>> {
     Box::pin(async move {
         if depth > 10 {
-            error!("Достигнута максимальная глубина рекурсии для '{}'", name);
+            error!("Max recursion depth reached for '{}'", name);
             return Ok((vec![], vec![]));
         }
 
-        let mut current_servers: Vec<IpAddr> = ROOT_SERVERS.to_vec();
-
+        let mut current_servers: Vec<IpAddr> = ROOT_SERVERS.iter().map(|&ip| IpAddr::V4(ip)).collect();
+        
         loop {
             let mut request = Message::query();
             let mut header = request.header().clone();
             header.set_id(random());
             header.set_recursion_desired(false);
             request.set_header(header);
-
+            
             let query = Query::query(name.clone(), record_type);
             request.add_query(query);
-
+            
             let mut request_bytes = Vec::new();
             let mut encoder = BinEncoder::new(&mut request_bytes);
             request.emit(&mut encoder)?;
-
+    
+            // Send queries to all current nameservers in parallel
             let mut futures = Vec::new();
             for server_ip in &current_servers {
                 let server_addr = SocketAddr::new(*server_ip, 53);
-                futures.push(send_udp_query(&request_bytes, &server_addr));
+                // Pass the SocketAddr by value to avoid lifetime issues.
+                futures.push(send_udp_query(&request_bytes, server_addr));
             }
 
             let mut successful_response = None;
@@ -270,7 +272,7 @@ fn recursive_lookup_with_cache(
                 let response_result = tokio::select! {
                     res = futures.remove(0) => res,
                     _ = tokio::time::sleep(DNS_REQUEST_TIMEOUT) => {
-                        warn!("Таймаут ожидания ответа.");
+                        warn!("Timeout waiting for response.");
                         continue;
                     },
                 };
@@ -286,31 +288,38 @@ fn recursive_lookup_with_cache(
 
             let response = match successful_response {
                 Some(res) => res,
-                None => return Err(io::Error::new(io::ErrorKind::TimedOut, "Не удалось получить ответ ни от одного сервера имен.").into()),
+                None => return Err(io::Error::new(io::ErrorKind::TimedOut, "Failed to get a response from any nameserver").into()),
             };
-
+    
             if !response.answers().is_empty() {
+                // We found the final answer
                 let answers = response.answers().to_vec();
                 if let Some(min_ttl) = answers.iter().map(|r| r.ttl()).min() {
                     let expires_at = Instant::now() + Duration::from_secs(min_ttl.into());
                     cache.insert((name.to_string(), record_type), CacheEntry { records: answers.clone(), expires_at });
                 }
+                
                 return Ok((answers, response.name_servers().to_vec()));
             }
 
+            // Handle CNAME records correctly
             if let Some(rec) = response.answers().iter().find(|rec| rec.record_type() == RecordType::CNAME) {
-                if let RData::CNAME(cname_name_record) = rec.data() {
-                    info!("Получен CNAME для '{}', рекурсия с '{}'", name, cname_name_record.0);
-                    return recursive_lookup_with_cache(cname_name_record.0.clone(), record_type, cache, depth + 1).await;
+                // Pattern match directly on the RData enum since `data()` returns &RData, not Option<&RData>
+                if let Some(RData::CNAME(cname_name_record)) = rec.data() {
+                    info!("Received CNAME for '{}', recursing with '{}'", name, cname_name_record.0);
+                    // Clone the cache Arc for the recursive call.
+                    return recursive_lookup_with_cache(cname_name_record.0.clone(), record_type, Arc::clone(&cache), depth + 1).await;
                 }
             }
-
+    
+            // Handle referrals if there are authority records
             if !response.name_servers().is_empty() {
                 let mut new_servers = Vec::new();
                 let mut ns_names = Vec::new();
-
+                
                 for record in response.name_servers() {
-                    if let RData::NS(ns_name_record) = record.data() {
+                    // Pattern match directly on the RData enum
+                    if let Some(RData::NS(ns_name_record)) = record.data() {
                         ns_names.push(ns_name_record.0.clone());
                         for additional_record in response.additionals() {
                             if additional_record.name() == &ns_name_record.0 {
@@ -321,34 +330,31 @@ fn recursive_lookup_with_cache(
                         }
                     }
                 }
-
+                
                 if new_servers.is_empty() {
-                    info!("Клеящие записи не найдены, выполняем новые запросы для NS-серверов.");
+                    info!("Glue records not found, performing new lookups for NS servers.");
                     for ns_name in &ns_names {
-                        if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::A, cache, depth + 1).await {
-                            for answer in answers {
-                                if let Some(ip) = extract_ip_from_rdata(answer.data()) {
-                                    new_servers.push(ip);
+                        // Clone the cache Arc for the recursive call.
+                        match recursive_lookup_with_cache(ns_name.clone(), RecordType::A, Arc::clone(&cache), depth + 1).await {
+                            Ok((answers, _)) => {
+                                for answer in answers {
+                                    if let Some(ip) = extract_ip_from_rdata(answer.data()) {
+                                        new_servers.push(ip);
+                                    }
                                 }
-                            }
-                        }
-                        if let Ok((answers, _)) = recursive_lookup_with_cache(ns_name.clone(), RecordType::AAAA, cache, depth + 1).await {
-                            for answer in answers {
-                                if let Some(ip) = extract_ip_from_rdata(answer.data()) {
-                                    new_servers.push(ip);
-                                }
-                            }
+                            },
+                            Err(e) => error!("Failed to resolve NS server {}: {}", ns_name, e),
                         }
                     }
                 }
-
+                
                 if new_servers.is_empty() {
-                    warn!("Не удалось найти IP-адреса для новых серверов имен, прекращение рекурсии.");
+                    warn!("Could not find IP addresses for new nameservers, stopping recursion.");
                     return Ok((vec![], response.name_servers().to_vec()));
                 }
-
+    
                 current_servers = new_servers;
-                info!("Следуем по перенаправлению на новые серверы: {:?}", current_servers);
+                info!("Following referral to new servers: {:?}", current_servers);
             } else {
                 return Ok((vec![], response.name_servers().to_vec()));
             }
@@ -356,25 +362,21 @@ fn recursive_lookup_with_cache(
     })
 }
 
-/// Отправляет UDP DNS-запрос и ожидает ответа с таймаутом.
-async fn send_udp_query(request_bytes: &[u8], server_addr: &SocketAddr) -> Result<Vec<u8>, anyhow::Error> {
-    let bind_addr = match server_addr.ip() {
-        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    };
-    
-    let socket = UdpSocket::bind(bind_addr).await?;
+/// Sends a UDP DNS query and waits for a response with a timeout.
+async fn send_udp_query(request_bytes: &[u8], server_addr: SocketAddr) -> Result<Vec<u8>, anyhow::Error> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
     tokio::time::timeout(DNS_REQUEST_TIMEOUT, socket.send_to(request_bytes, server_addr)).await??;
 
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     let (len, _) = tokio::time::timeout(DNS_REQUEST_TIMEOUT, socket.recv_from(&mut buf)).await??;
-
+    
     Ok(buf[..len].to_vec())
 }
 
-/// Вспомогательная функция для извлечения IP-адреса из `RData`.
+/// Helper function to extract an IpAddr from RData
 fn extract_ip_from_rdata(rdata: &RData) -> Option<IpAddr> {
     match rdata {
+        // Pattern match directly on the inner values of the RData tuple structs
         RData::A(ipv4_rdata) => Some(IpAddr::V4(ipv4_rdata.0)),
         RData::AAAA(ipv6_rdata) => Some(IpAddr::V6(ipv6_rdata.0)),
         _ => None,
