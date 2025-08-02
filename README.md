@@ -56,18 +56,15 @@ ASTRACAT DNS-резолвер 🚀
     sudo nano /etc/systemd/system/astracat-dns.service
 
     Добавьте конфигурацию:
-    Замените /path/to/your/dns-resolver-rust/ на фактический путь.
-
     [Unit]
     Description=ASTRACAT DNS Resolver
     After=network.target
 
     [Service]
-    ExecStart=/path/to/your/dns-resolver-rust/target/release/dns-resolver-rust
-    WorkingDirectory=/path/to/your/dns-resolver-rust
+    ExecStart=/root/The-ASTRACAT-DNS-Resolver/target/release/dns-resolver-rust
+    WorkingDirectory=/root/The-ASTRACAT-DNS-Resolver
     Restart=always
     RestartSec=3
-    Environment=RUST_LOG=info
 
     [Install]
     WantedBy=multi-user.target
