@@ -217,35 +217,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TerminalMode::Mixed,
         ColorChoice::Auto,
     )?;
-
-    let cache = Arc::new(Mutex::new(HashMap::new()));
-    // Биндимся на [::]:5353 для поддержки как IPv4, так и IPv6
-    let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, SERVER_PORT)).await?;
-
-    info!("DNS-сервер запущен на 127.0.0.1:{}", SERVER_PORT);
-
-    let mut buf = [0; 512];
     
-    // Создаем селектор для ожидания либо UDP-пакета, либо сигнала завершения
-    let mut shutdown_signal = Box::pin(tokio::signal::ctrl_c());
-    // Создаем интервал для периодической проверки работоспособности
-    let mut health_check_interval = interval(Duration::from_secs(30));
-
     loop {
-        tokio::select! {
-            // Ожидаем входящий UDP-пакет
+        let shutdown_signal = Box::pin(tokio::signal::ctrl_c());
+    
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, SERVER_PORT)).await?;
+    
+        info!("DNS-сервер запущен на 127.0.0.1:{}", SERVER_PORT);
+    
+        let mut buf = [0; 512];
+        let mut health_check_interval = interval(Duration::from_secs(30));
+    
+        let run_result: Result<(), Box<dyn std::error::Error>> = tokio::select! {
             Ok((len, src)) = socket.recv_from(&mut buf) => {
                 let cache_clone = Arc::clone(&cache);
                 let request_bytes = buf[..len].to_vec();
-        
+    
                 let (response_message, dest_addr) = tokio::spawn(async move {
                     info!("Received query from {}", src);
                     let mut response_message;
                     let response_code;
-        
+    
                     match Message::from_vec(&request_bytes) {
                         Ok(request_message) => {
-                            // Создаем ответное сообщение с правильными ID и OpCode сразу
                             response_message = Message::new(
                                 request_message.id(),
                                 MessageType::Response,
@@ -255,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(query) = request_message.queries().get(0) {
                                 info!("Starting recursive lookup for '{}' of type '{}'", query.name(), query.query_type());
                                 response_message.add_query(query.clone());
-        
+    
                                 match Box::pin(recursive_lookup_with_cache(
                                     query.name().clone(),
                                     query.query_type(),
@@ -291,7 +286,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => {
                             error!("Failed to parse DNS query from '{}'. Reason: {}", src, e);
                             response_code = ResponseCode::FormErr;
-                            // Создаем сообщение по умолчанию для некорректного пакета
                             response_message = Message::new(0, MessageType::Response, OpCode::Query);
                         }
                     }
@@ -300,35 +294,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (response_message, src)
                 })
                 .await?;
-        
+    
                 let response_buffer = response_message.to_vec()?;
                 socket.send_to(&response_buffer, dest_addr).await?;
+                Ok(())
             }
-            // Ожидаем срабатывание интервала проверки здоровья
             _ = health_check_interval.tick() => {
                 let health_check_domain = Name::from_ascii("health-check.google.com").unwrap();
                 let cache_clone = Arc::clone(&cache);
                 info!("Running periodic health check...");
-
-                tokio::spawn(async move {
-                    match Box::pin(recursive_lookup_with_cache(
-                        health_check_domain.clone(),
-                        RecordType::A,
-                        cache_clone,
-                        0,
-                    )).await {
-                        Ok(ip) => info!("Health check passed. Resolved '{}' to {}", health_check_domain, ip),
-                        Err(e) => error!("Health check FAILED for '{}'. Reason: {}", health_check_domain, e),
-                    }
-                });
+    
+                let lookup_result = Box::pin(recursive_lookup_with_cache(
+                    health_check_domain.clone(),
+                    RecordType::A,
+                    cache_clone,
+                    0,
+                )).await;
+                
+                if let Err(e) = lookup_result {
+                    error!("Health check FAILED for '{}'. Reason: {}. Exiting process...", health_check_domain, e);
+                    Err(Box::<dyn std::error::Error>::from("Health check failed"))
+                } else {
+                    info!("Health check passed. Resolved '{}'", health_check_domain);
+                    Ok(())
+                }
             }
-            // Ожидаем сигнал Ctrl+C
-            _ = &mut shutdown_signal => {
+            _ = shutdown_signal => {
                 info!("Получен сигнал Ctrl+C. Завершение работы...");
-                break;
+                Ok(())
             }
+        };
+    
+        if let Err(_) = run_result {
+            return Err("Health check failed, exiting for restart".into());
+        }
+        
+        if run_result.is_ok() {
+            break;
         }
     }
-
+    
     Ok(())
 }
