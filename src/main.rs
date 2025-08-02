@@ -1,8 +1,8 @@
 // main.rs
-// ASTRACAT DNS Resolver - V7
-// This version introduces a more robust recovery mechanism by ensuring the main
-// loop acts as a supervisor, gracefully handling and recovering from potential
-// panics or unhandled errors in the server's core logic.
+// ASTRACAT DNS Resolver - V8
+// This version introduces a robust monitoring and recovery mechanism using a CancellationToken
+// for graceful task shutdown. This is a more idiomatic and safe approach in Rust/Tokio
+// than trying to abort tasks, which can lead to ownership issues.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -19,6 +19,9 @@ use anyhow::{Result, Context};
 use rand::random;
 use dashmap::DashMap;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 /// The maximum UDP payload size for DNS messages.
 const MAX_UDP_PAYLOAD_SIZE: usize = 512;
 /// The port for the DNS server to listen on.
@@ -30,6 +33,9 @@ const DNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const PREFETCH_THRESHOLD: Duration = Duration::from_secs(60);
 /// The duration after which the server's main loop will restart.
 const RESTART_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+/// The maximum time to wait for a heartbeat from the server's main loop.
+/// If this time is exceeded, the server is considered non-responsive.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30); // 30 seconds
 
 /// The list of root DNS servers, including both IPv4 and IPv6 addresses.
 const ROOT_SERVERS: &[IpAddr] = &[
@@ -76,20 +82,40 @@ async fn main() -> Result<()> {
     loop {
         println!("Starting ASTRACAT DNS resolver on 0.0.0.0:{} (dual-stack)", DNS_PORT);
         
-        let server_future = run_server();
+        // CancellationToken for graceful shutdown
+        let shutdown_token = CancellationToken::new();
+        let shutdown_token_server = shutdown_token.clone();
+        let shutdown_token_monitor = shutdown_token.clone();
+        let (tx, rx) = mpsc::channel(1); // Channel for heartbeats
+
+        // Start the server's main logic as a separate task
+        let server_task = tokio::spawn(run_server(tx, shutdown_token_server));
         
+        // Start the heartbeat monitor as a separate task
+        let monitor_task = tokio::spawn(heartbeat_monitor(rx, shutdown_token_monitor));
+
+        // Use `tokio::select!` to monitor for a crash or a scheduled restart signal
         let result = tokio::select! {
-            // Wait for the server to finish (either successfully or with an error)
-            server_result = server_future => server_result,
-            // Or wait for the restart timer to expire
+            server_result = server_task => {
+                // The server task exited, signal a shutdown to the monitor
+                shutdown_token.cancel();
+                server_result.context("Server task panicked")?
+            },
+            monitor_result = monitor_task => {
+                // The monitor task exited, signal a shutdown to the server
+                shutdown_token.cancel();
+                monitor_result.context("Monitor task panicked")?
+            },
             _ = tokio::time::sleep(RESTART_INTERVAL) => {
+                // Scheduled restart timer expired, signal a shutdown to all
+                shutdown_token.cancel();
                 println!("Scheduled restart initiated. Shutting down and restarting the server...");
                 Ok(())
             }
         };
 
         if let Err(e) = result {
-            eprintln!("ASTRACAT DNS resolver encountered a fatal error: {}", e);
+            eprintln!("ASTRACAT DNS resolver encountered a fatal error: {}. Restarting...", e);
         }
         
         println!("Restarting server in 1 second...");
@@ -98,7 +124,8 @@ async fn main() -> Result<()> {
 }
 
 /// The main server logic, now extracted into its own function.
-async fn run_server() -> Result<()> {
+/// It takes a Sender to send heartbeats and a CancellationToken for graceful shutdown.
+async fn run_server(heartbeat_tx: mpsc::Sender<()>, shutdown_token: CancellationToken) -> Result<()> {
     let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DNS_PORT);
     let sock = Arc::new(UdpSocket::bind(bind_addr).await.context("Failed to bind UDP socket")?);
     let cache: Cache = Arc::new(DashMap::new());
@@ -106,8 +133,16 @@ async fn run_server() -> Result<()> {
     println!("Listening on {}", bind_addr);
 
     let cache_clone_prefetch = Arc::clone(&cache);
+    let shutdown_token_prefetch = shutdown_token.clone(); // Clone the token for the prefetch task
+
     tokio::spawn(async move {
         loop {
+            // Check for shutdown signal
+            if shutdown_token_prefetch.is_cancelled() {
+                println!("Prefetch task received shutdown signal. Exiting gracefully.");
+                return;
+            }
+
             let now = Instant::now();
             cache_clone_prefetch.retain(|_, v| v.expires_at > now);
 
@@ -139,50 +174,79 @@ async fn run_server() -> Result<()> {
 
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     loop {
-        // We handle potential errors from recv_from() and continue the loop instead of crashing
-        let (len, addr) = match sock.recv_from(&mut buf).await {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("Error receiving from socket: {}. Continuing...", e);
-                continue;
-            }
-        };
-
-        let sock_clone = Arc::clone(&sock);
-        let cache_clone = Arc::clone(&cache);
-        let request_bytes_owned = buf[..len].to_vec();
-
-        tokio::spawn(async move {
-            match handle_query(&request_bytes_owned, &cache_clone).await {
-                Ok(response_message) => {
-                    let mut response_bytes = Vec::new();
-                    let mut encoder = BinEncoder::new(&mut response_bytes);
-                    if response_message.emit(&mut encoder).is_ok() {
-                        if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
-                            eprintln!("Failed to send response to {}: {}", addr, e);
-                        }
+        tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                println!("Server task received shutdown signal. Exiting gracefully.");
+                return Ok(());
+            },
+            recv_result = sock.recv_from(&mut buf) => {
+                let (len, addr) = match recv_result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        eprintln!("Error receiving from socket: {}. Continuing...", e);
+                        continue;
                     }
-                },
-                Err(e) => {
-                    eprintln!("Error handling query from {}: {}", addr, e);
-                    if let Ok(request_message) = Message::from_vec(&request_bytes_owned) {
-                        let failure_message = Message::error_msg(
-                            request_message.header().id(),
-                            request_message.op_code(),
-                            ResponseCode::ServFail,
-                        );
+                };
 
-                        let mut response_bytes = Vec::new();
-                        let mut encoder = BinEncoder::new(&mut response_bytes);
-                        if failure_message.emit(&mut encoder).is_ok() {
-                            if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
-                                eprintln!("Failed to send error response to {}: {}", addr, e);
+                let _ = heartbeat_tx.try_send(());
+
+                let sock_clone = Arc::clone(&sock);
+                let cache_clone = Arc::clone(&cache);
+                let request_bytes_owned = buf[..len].to_vec();
+        
+                tokio::spawn(async move {
+                    match handle_query(&request_bytes_owned, &cache_clone).await {
+                        Ok(response_message) => {
+                            let mut response_bytes = Vec::new();
+                            let mut encoder = BinEncoder::new(&mut response_bytes);
+                            if response_message.emit(&mut encoder).is_ok() {
+                                if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
+                                    eprintln!("Failed to send response to {}: {}", addr, e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error handling query from {}: {}", addr, e);
+                            if let Ok(request_message) = Message::from_vec(&request_bytes_owned) {
+                                let failure_message = Message::error_msg(
+                                    request_message.header().id(),
+                                    request_message.op_code(),
+                                    ResponseCode::ServFail,
+                                );
+        
+                                let mut response_bytes = Vec::new();
+                                let mut encoder = BinEncoder::new(&mut response_bytes);
+                                if failure_message.emit(&mut encoder).is_ok() {
+                                    if let Err(e) = sock_clone.send_to(&response_bytes, addr).await {
+                                        eprintln!("Failed to send error response to {}: {}", addr, e);
+                                    }
+                                }
                             }
                         }
                     }
-                }
+                });
             }
-        });
+        }
+    }
+}
+
+/// A separate task that monitors for heartbeats from the server.
+/// If no heartbeat is received within the timeout, it returns an error.
+async fn heartbeat_monitor(mut rx: mpsc::Receiver<()>, shutdown_token: CancellationToken) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                println!("Heartbeat monitor received shutdown signal. Exiting gracefully.");
+                return Ok(());
+            },
+            _ = rx.recv() => {
+                // Heartbeat received, continue the loop and reset the timer
+            },
+            _ = tokio::time::sleep(HEARTBEAT_TIMEOUT) => {
+                // Timeout without a heartbeat, return an error
+                return Err(anyhow::anyhow!("Heartbeat timeout: The server is non-responsive."));
+            }
+        }
     }
 }
 
