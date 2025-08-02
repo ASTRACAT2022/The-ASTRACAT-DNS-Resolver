@@ -9,7 +9,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use log::{error, info, warn};
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::time::{timeout, interval};
 
 // Используем Arc<Mutex<_>> для безопасного доступа к кэшу в нескольких потоках
 type Cache = Arc<Mutex<HashMap<String, (IpAddr, Instant)>>>;
@@ -77,14 +77,14 @@ fn recursive_lookup_with_cache(
         let cache_key = name.to_string();
         if let Some((addr, timestamp)) = cache.lock().unwrap().get(&cache_key) {
             if timestamp.elapsed().as_secs() < CACHE_LIFETIME_SECONDS {
-                info!("Cache hit for {}", cache_key);
+                info!("Cache hit for '{}'", cache_key);
                 return Ok(*addr);
             } else {
-                info!("Cache expired for {}", cache_key);
+                info!("Cache expired for '{}'", cache_key);
             }
         }
 
-        info!("Attempting to resolve {} (depth: {})", name, depth);
+        info!("Attempting to resolve '{}' (depth: {})", name, depth);
 
         let mut current_server = IpAddr::V4(ROOT_SERVER.parse()?);
         let mut resolved_address: Option<IpAddr> = None;
@@ -94,15 +94,18 @@ fn recursive_lookup_with_cache(
             let response_message = match send_and_receive_udp(&current_server, &query_message).await {
                 Ok(msg) => msg,
                 Err(e) => {
-                    error!("Error sending query to {}: {}", current_server, e);
+                    error!(
+                        "Error sending query for '{}' to {}: {}",
+                        name, current_server, e
+                    );
                     return Err(e);
                 }
             };
 
             match response_message.response_code() {
                 ResponseCode::NoError => {}
-                ResponseCode::NXDomain => return Err("NXDOMAIN: Domain does not exist".into()),
-                _ => return Err(format!("DNS error: {:?}", response_message.response_code()).into()),
+                ResponseCode::NXDomain => return Err(format!("NXDOMAIN: Domain '{}' does not exist", name).into()),
+                _ => return Err(format!("DNS error for '{}': {:?}", name, response_message.response_code()).into()),
             }
 
             if let Some(ip) = process_answers(&response_message, &name, record_type) {
@@ -175,7 +178,7 @@ fn recursive_lookup_with_cache(
                 }
             }
 
-            warn!("No answers or referrals received. Giving up on {}", name);
+            warn!("No answers or referrals received. Giving up on '{}'", name);
             break;
         }
 
@@ -222,75 +225,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("DNS-сервер запущен на 127.0.0.1:{}", SERVER_PORT);
 
     let mut buf = [0; 512];
+    
+    // Создаем селектор для ожидания либо UDP-пакета, либо сигнала завершения
+    let mut shutdown_signal = Box::pin(tokio::signal::ctrl_c());
+    // Создаем интервал для периодической проверки работоспособности
+    let mut health_check_interval = interval(Duration::from_secs(30));
+
     loop {
-        let (len, src) = socket.recv_from(&mut buf).await?;
-        let cache_clone = Arc::clone(&cache);
-        let request_bytes = buf[..len].to_vec();
-
-        let (response_message, dest_addr) = tokio::spawn(async move {
-            info!("Received query from {}", src);
-            let mut response_message;
-            let response_code;
-
-            match Message::from_vec(&request_bytes) {
-                Ok(request_message) => {
-                    // Создаем ответное сообщение с правильными ID и OpCode сразу
-                    response_message = Message::new(
-                        request_message.id(),
-                        MessageType::Response,
-                        request_message.op_code(),
-                    );
-                    
-                    if let Some(query) = request_message.queries().get(0) {
-                        info!("Starting recursive lookup for '{}'", query.name());
-                        response_message.add_query(query.clone());
-
-                        match Box::pin(recursive_lookup_with_cache(
-                            query.name().clone(),
-                            query.query_type(),
-                            cache_clone,
-                            0,
-                        ))
-                        .await
-                        {
-                            Ok(resolved_ip) => {
-                                let rdata = match resolved_ip {
-                                    IpAddr::V4(ipv4) => RData::A(ipv4.into()),
-                                    IpAddr::V6(ipv6) => RData::AAAA(ipv6.into()),
-                                };
-                                let record = Record::from_rdata(query.name().clone(), 3600, rdata);
-                                response_message.add_answer(record);
-                                response_code = ResponseCode::NoError;
-                                info!("Successfully resolved {} to {}", query.name(), resolved_ip);
-                            }
-                            Err(e) => {
-                                error!("Failed to resolve '{}'. Reason: {}", query.name(), e);
-                                if e.to_string().contains("NXDOMAIN") {
-                                    response_code = ResponseCode::NXDomain;
-                                } else {
-                                    response_code = ResponseCode::ServFail;
+        tokio::select! {
+            // Ожидаем входящий UDP-пакет
+            Ok((len, src)) = socket.recv_from(&mut buf) => {
+                let cache_clone = Arc::clone(&cache);
+                let request_bytes = buf[..len].to_vec();
+        
+                let (response_message, dest_addr) = tokio::spawn(async move {
+                    info!("Received query from {}", src);
+                    let mut response_message;
+                    let response_code;
+        
+                    match Message::from_vec(&request_bytes) {
+                        Ok(request_message) => {
+                            // Создаем ответное сообщение с правильными ID и OpCode сразу
+                            response_message = Message::new(
+                                request_message.id(),
+                                MessageType::Response,
+                                request_message.op_code(),
+                            );
+                            
+                            if let Some(query) = request_message.queries().get(0) {
+                                info!("Starting recursive lookup for '{}' of type '{}'", query.name(), query.query_type());
+                                response_message.add_query(query.clone());
+        
+                                match Box::pin(recursive_lookup_with_cache(
+                                    query.name().clone(),
+                                    query.query_type(),
+                                    cache_clone,
+                                    0,
+                                ))
+                                .await
+                                {
+                                    Ok(resolved_ip) => {
+                                        let rdata = match resolved_ip {
+                                            IpAddr::V4(ipv4) => RData::A(ipv4.into()),
+                                            IpAddr::V6(ipv6) => RData::AAAA(ipv6.into()),
+                                        };
+                                        let record = Record::from_rdata(query.name().clone(), 3600, rdata);
+                                        response_message.add_answer(record);
+                                        response_code = ResponseCode::NoError;
+                                        info!("Successfully resolved '{}' to {}", query.name(), resolved_ip);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to resolve '{}'. Reason: {}", query.name(), e);
+                                        if e.to_string().contains("NXDOMAIN") {
+                                            response_code = ResponseCode::NXDomain;
+                                        } else {
+                                            response_code = ResponseCode::ServFail;
+                                        }
+                                    }
                                 }
+                            } else {
+                                error!("Received query with no questions.");
+                                response_code = ResponseCode::FormErr;
                             }
                         }
-                    } else {
-                        error!("Received query with no questions.");
-                        response_code = ResponseCode::FormErr;
+                        Err(e) => {
+                            error!("Failed to parse DNS query from '{}'. Reason: {}", src, e);
+                            response_code = ResponseCode::FormErr;
+                            // Создаем сообщение по умолчанию для некорректного пакета
+                            response_message = Message::new(0, MessageType::Response, OpCode::Query);
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Failed to parse DNS query from '{}'. Reason: {}", src, e);
-                    response_code = ResponseCode::FormErr;
-                    // Создаем сообщение по умолчанию для некорректного пакета
-                    response_message = Message::new(0, MessageType::Response, OpCode::Query);
-                }
+                    
+                    response_message.set_response_code(response_code);
+                    (response_message, src)
+                })
+                .await?;
+        
+                let response_buffer = response_message.to_vec()?;
+                socket.send_to(&response_buffer, dest_addr).await?;
             }
-            
-            response_message.set_response_code(response_code);
-            (response_message, src)
-        })
-        .await?;
+            // Ожидаем срабатывание интервала проверки здоровья
+            _ = health_check_interval.tick() => {
+                let health_check_domain = Name::from_ascii("health-check.google.com").unwrap();
+                let cache_clone = Arc::clone(&cache);
+                info!("Running periodic health check...");
 
-        let response_buffer = response_message.to_vec()?;
-        socket.send_to(&response_buffer, dest_addr).await?;
+                tokio::spawn(async move {
+                    match Box::pin(recursive_lookup_with_cache(
+                        health_check_domain.clone(),
+                        RecordType::A,
+                        cache_clone,
+                        0,
+                    )).await {
+                        Ok(ip) => info!("Health check passed. Resolved '{}' to {}", health_check_domain, ip),
+                        Err(e) => error!("Health check FAILED for '{}'. Reason: {}", health_check_domain, e),
+                    }
+                });
+            }
+            // Ожидаем сигнал Ctrl+C
+            _ = &mut shutdown_signal => {
+                info!("Получен сигнал Ctrl+C. Завершение работы...");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
