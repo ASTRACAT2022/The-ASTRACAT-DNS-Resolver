@@ -1,12 +1,25 @@
+# ASTRACAT DNS Resolver
 [package]
 name = "dns-resolver-rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Асинхронность
 tokio = { version = "1.37.0", features = ["full"] }
-anyhow = "1.0.82"
-hickory-proto = { version = "0.26.0-alpha.1" }
+
+# DNS-парсинг и сборка
+hickory-proto = "0.26.0-alpha.1"
+
+# Ошибки
+anyhow = "1.0"
+
+# Логгирование (если нужно)
+log = "0.4"
+simplelog = "0.12"
+
+# Дополнительные (если используешь кэш, параллельность или фильтрацию)
 rand = "0.8.5"
-env_logger = "0.11.3"
-dashmap = "5.5"
+futures = "0.3.30"
+dashmap = "5.5.3"
+tokio-util = "0.7.11"
