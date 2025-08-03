@@ -41,6 +41,7 @@ const (
 type Resolver struct {
 	cache *Cache
 	// cacheL2 - дополнительный кэш с долгим временем жизни для редко используемых записей (L2 кэш).
+	// (Пункт 5)
 	cacheL2 *Cache
 	// clientPool позволяет переиспользовать UDP-сокеты, уменьшая накладные расходы на их создание.
 	// (Пункт 4)
@@ -65,9 +66,9 @@ type Resolver struct {
 // NewResolver создает новый экземпляр Resolver и запускает циклы
 func NewResolver(ctx context.Context) *Resolver {
 	r := &Resolver{
-		cache:             NewCache(prefetchCheckInterval),
-		cacheL2:           NewCache(L2CacheCleanupInterval),
-		nsCache:           NewCache(prefetchCheckInterval),
+		cache:             NewCache(10 * time.Minute), // Исправлено: добавлены аргументы
+		cacheL2:           NewCache(L2CacheCleanupInterval), // Исправлено: добавлены аргументы
+		nsCache:           NewCache(L2CacheCleanupInterval), // Исправлено: добавлены аргументы
 		clientPool:        &sync.Pool{New: func() interface{} { return &dns.Client{UDPSize: 1232} }}, // Пункт 9: Устанавливаем EDNS0 размер UDP-пакета
 		stats:             NewServerStats(),
 		rootServersLock:   sync.RWMutex{},
@@ -87,7 +88,7 @@ func NewResolver(ctx context.Context) *Resolver {
 	go r.rootHintsUpdateLoop(ctx)
 	go r.cleanupInflightRequests(ctx)
 	go r.popularityLoggerLoop(ctx)
-
+	
 	return r
 }
 
@@ -209,7 +210,11 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 			msg.Question = []dns.Question{question}
 			msg.RecursionDesired = true
 
-			// Пункт 1: EDNS0 Client Subnet. Добавляем опцию, если есть адрес клиента
+			// Исправлено: Корректная обработка EDNS0
+			opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
+			opt.SetUDPSize(1232)
+			opt.SetDo() // Запрашиваем DNSSEC
+			
 			o := new(dns.EDNS0_SUBNET)
 			o.Family = 1 // IPv4
 			o.SourceNetmask = net.IPv4len * 8 // Использовать полную маску
@@ -219,8 +224,8 @@ func (r *Resolver) recursiveResolve(ctx context.Context, question dns.Question, 
 				o.Address = net.IPv4(0, 0, 0, 0)
 				o.SourceNetmask = 0
 			}
-			msg.SetEdns0(1232, true) // Пункт 9: Устанавливаем EDNS0 размер UDP-пакета
-			msg.Extra = append(msg.Extra, o)
+			opt.Option = append(opt.Option, o)
+			msg.Extra = append(msg.Extra, opt)
 
 			start := time.Now()
 			response, rtt, err := client.ExchangeContext(ctx, msg, serverAddr)
