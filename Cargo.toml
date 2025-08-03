@@ -1,0 +1,12 @@
+[package]
+name = "dns-resolver-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.37.0", features = ["full"] }
+anyhow = "1.0.82"
+hickory-proto = { version = "0.26.0-alpha.1" }
+rand = "0.8.5"
+env_logger = "0.11.3"
+dashmap = "5.5"
