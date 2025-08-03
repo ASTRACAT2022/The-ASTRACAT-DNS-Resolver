@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -16,13 +17,20 @@ type CacheEntry struct {
 type Cache struct {
 	mu      sync.RWMutex
 	entries map[string]CacheEntry
+	// Добавлено поле для периодической очистки
+	cleanupInterval time.Duration
 }
 
-func NewCache() *Cache {
+// NewCache создает новый кэш и запускает цикл очистки.
+func NewCache(cleanupInterval time.Duration) *Cache {
 	c := &Cache{
-		entries: make(map[string]CacheEntry),
+		entries:         make(map[string]CacheEntry),
+		cleanupInterval: cleanupInterval,
 	}
-	go c.cleanupLoop()
+	// Запускаем горутину очистки только если интервал задан
+	if cleanupInterval > 0 {
+		go c.cleanupLoop()
+	}
 	return c
 }
 
@@ -69,8 +77,14 @@ func (c *Cache) GetSoonToExpireEntries(ratio float64) []*CacheEntry {
 	return soonToExpire
 }
 
+// Изменено: цикл очистки теперь использует cleanupInterval
 func (c *Cache) cleanupLoop() {
-	ticker := time.NewTicker(1 * time.Minute)
+	if c.cleanupInterval == 0 {
+		log.Printf("Debug: Cache cleanup loop is not running for this cache.")
+		return
+	}
+	
+	ticker := time.NewTicker(c.cleanupInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
