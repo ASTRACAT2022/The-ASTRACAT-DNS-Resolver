@@ -99,7 +99,8 @@ func handleDNSRequest(conn *net.UDPConn, clientAddr *net.UDPAddr, request []byte
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	response, err := r.Resolve(ctx, request)
+	// Изменено: передача clientAddr в функцию Resolve
+	response, err := r.Resolve(ctx, request, clientAddr)
 	if err != nil {
 		log.Printf("Error: Ошибка резолвинга запроса от %s: %v", clientAddr.String(), err)
 		rcode := dns.RcodeServerFailure
