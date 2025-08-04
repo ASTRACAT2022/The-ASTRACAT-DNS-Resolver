@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use rand::seq::SliceRandom;
 use async_recursion::async_recursion;
 use lazy_static::lazy_static;
 use prometheus_exporter::{
