@@ -1,29 +1,79 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
-
-use crate::dns::{
-    byte_packet_buffer::BytePacketBuffer,
-    dns_packet::DnsPacket,
-    dns_question::DnsQuestion,
-    dns_record::DnsRecord,
-    query_type::QueryType,
-    result_code::ResultCode,
-    Result,
-};
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use async_recursion::async_recursion;
+use lazy_static::lazy_static;
+use prometheus_exporter::{
+    self,
+    prometheus::{
+        register_counter_vec, register_histogram_vec, register_gauge, CounterVec, HistogramVec,
+        Gauge,
+    },
+};
 
 mod dns;
 
-const ROOT_SERVER: Ipv4Addr = Ipv4Addr::new(198, 41, 0, 4);
+use crate::dns::{
+    byte_packet_buffer::BytePacketBuffer, dns_packet::DnsPacket, dns_question::DnsQuestion,
+    dns_record::DnsRecord, query_type::QueryType, result_code::ResultCode, Result,
+};
+
+// Определяем метрики
+lazy_static! {
+    static ref DNS_QUERIES_TOTAL: CounterVec = register_counter_vec!(
+        "dns_queries_total",
+        "Total number of DNS queries received.",
+        &["result"]
+    )
+    .unwrap();
+    static ref DNS_QUERY_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "dns_query_duration_seconds",
+        "Duration of DNS queries in seconds.",
+        &["result"]
+    )
+    .unwrap();
+    static ref DNS_CACHE_HITS_TOTAL: CounterVec =
+        register_counter_vec!("dns_cache_hits_total", "Total number of DNS cache hits.", &["type"])
+            .unwrap();
+    static ref DNS_CACHE_MISSES_TOTAL: CounterVec = register_counter_vec!(
+        "dns_cache_misses_total",
+        "Total number of DNS cache misses.",
+        &["type"]
+    )
+    .unwrap();
+}
+
+// Корневые DNS-серверы
+const ROOT_SERVERS: &[Ipv4Addr] = &[
+    Ipv4Addr::new(198, 41, 0, 4),    // A
+    Ipv4Addr::new(199, 9, 14, 201),  // B
+    Ipv4Addr::new(192, 33, 4, 12),   // C
+    Ipv4Addr::new(199, 7, 91, 13),   // D
+    Ipv4Addr::new(192, 203, 230, 10), // E
+    Ipv4Addr::new(192, 5, 5, 241),   // F
+    Ipv4Addr::new(192, 112, 36, 4),  // G
+    Ipv4Addr::new(198, 97, 190, 53), // H
+    Ipv4Addr::new(192, 36, 148, 17), // I
+    Ipv4Addr::new(192, 58, 128, 30), // J
+    Ipv4Addr::new(193, 0, 14, 129),  // K
+    Ipv4Addr::new(199, 7, 83, 42),   // L
+    Ipv4Addr::new(202, 12, 27, 33),  // M
+];
+
+// Базовый кеш
+lazy_static! {
+    static ref DNS_CACHE: Arc<parking_lot::RwLock<HashMap<(String, QueryType), (DnsPacket, Instant)>>> =
+        Arc::new(parking_lot::RwLock::new(HashMap::new()));
+}
 
 #[async_recursion]
-async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
-    let mut nameserver = ROOT_SERVER;
+async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Result<DnsPacket> {
     const MAX_DEPTH: u8 = 10;
     let mut depth = 0;
+    let mut current_nameserver = nameserver;
 
     loop {
         if depth >= MAX_DEPTH {
@@ -31,22 +81,18 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
         }
         depth += 1;
 
-        // println!("Выполняем поиск '{}' на сервере {}", qname, nameserver);
-
         let mut packet = DnsPacket::new();
         packet.header.id = 6666;
         packet.header.recursion_desired = false;
         packet.header.questions = 1;
-        packet
-            .questions
-            .push(DnsQuestion::new(qname.clone(), qtype));
+        packet.questions.push(DnsQuestion::new(qname.clone(), qtype));
 
         let mut req_buffer = BytePacketBuffer::new();
         packet.write(&mut req_buffer)?;
         let req_bytes = req_buffer.get_range(0, req_buffer.pos())?;
 
         let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
-        socket.send_to(req_bytes, (nameserver, 53)).await?;
+        socket.send_to(req_bytes, (current_nameserver, 53)).await?;
 
         let mut res_buffer = BytePacketBuffer::new();
         let res = timeout(Duration::from_secs(3), socket.recv_from(&mut res_buffer.buf)).await;
@@ -55,7 +101,8 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
             Ok(Ok(val)) => val,
             Ok(Err(e)) => return Err(format!("Ошибка сокета: {}", e).into()),
             Err(_) => {
-                // println!("Тайм-аут, повторяем...");
+                // Тайм-аут, пробуем другой корневой сервер
+                current_nameserver = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
                 continue;
             }
         };
@@ -63,7 +110,6 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
         let res_packet = DnsPacket::from_buffer(&mut res_buffer)?;
 
         if !res_packet.answers.is_empty() {
-            // println!("Найден ответ!");
             return Ok(res_packet);
         }
 
@@ -71,7 +117,6 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
             return Err("Домен не существует.".into());
         }
 
-        // Итеративная обработка CNAME
         if let Some(cname_record) = res_packet.answers.iter().find_map(|rec| {
             if let DnsRecord::CNAME { domain, host, .. } = rec {
                 if qname.ends_with(domain) {
@@ -80,9 +125,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
             }
             None
         }) {
-            // println!("Получен CNAME, обновляем имя для поиска: {}", cname_record);
             qname = cname_record;
-            // Переходим на следующую итерацию с новым именем
             continue;
         }
 
@@ -102,13 +145,11 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
                 }
                 None
             }) {
-                // println!("Найдена 'клейкая запись' для NS: {}", a_record);
-                nameserver = a_record;
+                current_nameserver = a_record;
             } else {
-                // println!("'Клейкой записи' нет, выполняем рекурсивный поиск для NS: {}", ns_record);
-                let ns_ip_packet = lookup(ns_record.clone(), QueryType::A).await?;
+                let ns_ip_packet = lookup(ns_record.clone(), QueryType::A, current_nameserver).await?;
                 if let Some(ns_ip) = ns_ip_packet.get_random_a() {
-                    nameserver = ns_ip;
+                    current_nameserver = ns_ip;
                 } else {
                     return Err(format!("Не удалось разрешить NS-запись для {}", ns_record).into());
                 }
@@ -121,6 +162,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
 }
 
 async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<()> {
+    let start_time = Instant::now();
     let req_packet = DnsPacket::from_buffer(&mut req_buffer.clone())?;
     
     let mut res_packet = DnsPacket::new();
@@ -130,22 +172,46 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
     res_packet.header.response = true;
 
     if let Some(question) = req_packet.questions.get(0) {
-        // println!("Получен запрос от {} для домена '{}'", src, question.name);
         res_packet.questions.push(question.clone());
 
-        match lookup(question.name.clone(), question.qtype).await {
-            Ok(answers) => {
-                res_packet.header.rescode = ResultCode::NOERROR;
-                res_packet.answers = answers.answers;
-                res_packet.header.answers = res_packet.answers.len() as u16;
+        // Проверяем кеш
+        {
+            let cache = DNS_CACHE.read();
+            if let Some((cached_packet, expiry)) = cache.get(&(question.name.clone(), question.qtype)) {
+                if expiry.elapsed() < Duration::from_secs(600) {
+                    // Кеш действителен
+                    res_packet.answers = cached_packet.answers.clone();
+                    res_packet.header.rescode = ResultCode::NOERROR;
+                    DNS_CACHE_HITS_TOTAL.with_label_values(&["A"]).inc();
+                }
             }
-            Err(e) => {
-                eprintln!("Ошибка при разрешении домена '{}': {}", question.name, e);
-                res_packet.header.rescode = ResultCode::SERVFAIL;
+        }
+
+        if res_packet.answers.is_empty() {
+            // Кеш промахнулся или устарел
+            DNS_CACHE_MISSES_TOTAL.with_label_values(&["A"]).inc();
+            
+            // Выбираем случайный корневой сервер
+            let root_server = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
+
+            match lookup(question.name.clone(), question.qtype, root_server).await {
+                Ok(answers) => {
+                    res_packet.header.rescode = ResultCode::NOERROR;
+                    res_packet.answers = answers.answers.clone();
+                    res_packet.header.answers = res_packet.answers.len() as u16;
+                    
+                    // Добавляем в кеш
+                    let mut cache = DNS_CACHE.write();
+                    cache.insert((question.name.clone(), question.qtype), (answers, Instant::now()));
+                }
+                Err(e) => {
+                    eprintln!("Ошибка при разрешении домена '{}': {}", question.name, e);
+                    res_packet.header.rescode = ResultCode::SERVFAIL;
+                }
             }
         }
     } else {
-        res_packet.header.rescode = ResultCode::FORMERR;
+    res_packet.header.rescode = ResultCode::FORMERR;
     }
 
     let mut res_buffer = BytePacketBuffer::new();
@@ -155,11 +221,31 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
     
     socket.send_to(res_bytes, src).await?;
 
+    let duration = start_time.elapsed();
+    let result_label = if res_packet.header.rescode == ResultCode::NOERROR {
+        "success"
+    } else {
+        "error"
+    };
+
+    DNS_QUERIES_TOTAL.with_label_values(&[result_label]).inc();
+    DNS_QUERY_DURATION_SECONDS
+        .with_label_values(&[result_label])
+        .observe(duration.as_secs_f64());
+
     Ok(())
 }
 
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Запускаем экспортер Prometheus
+    let exporter_addr = "0.0.0.0:9090".parse().unwrap();
+    println!("Экспортер Prometheus запущен на {}", exporter_addr);
+    tokio::spawn(async move {
+        prometheus_exporter::start(exporter_addr).unwrap();
+    });
+
     let socket = UdpSocket::bind(("0.0.0.0", 5300)).await?;
     let shared_socket = Arc::new(socket);
     println!("DNS-сервер запущен на порту 5300");
