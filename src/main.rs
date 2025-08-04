@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use crate::dns::{
     byte_packet_buffer::BytePacketBuffer,
@@ -11,20 +12,21 @@ use crate::dns::{
     Result,
 };
 use tokio::net::UdpSocket;
+use tokio::time::timeout;
 
 mod dns;
 
 const ROOT_SERVER: Ipv4Addr = Ipv4Addr::new(198, 41, 0, 4);
+const MAX_RETRIES: u8 = 5;
 
-// Логика итеративного поиска, которая была в предыдущей версии main.rs
+// Логика итеративного поиска
 async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     let mut nameserver = ROOT_SERVER;
     let mut num_retries = 0;
-    const MAX_RETRIES: u8 = 5;
 
     loop {
         if num_retries >= MAX_RETRIES {
-            return Err("Превышено максимальное количество попыток".into());
+            return Err("Превышено максимальное количество попыток.".into());
         }
 
         println!("Выполняем поиск '{}' на сервере {}", qname, nameserver);
@@ -41,12 +43,16 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
         packet.write(&mut req_buffer)?;
         let req_bytes = req_buffer.get_range(0, req_buffer.pos())?;
 
+        // Создаем новый временный сокет для отправки запроса
         let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
         socket.send_to(req_bytes, (nameserver, 53)).await?;
 
         let mut res_buffer = BytePacketBuffer::new();
-        let (_len, _src) = match tokio::time::timeout(std::time::Duration::from_secs(3), socket.recv_from(&mut res_buffer.buf)).await {
-            Ok(val) => val,
+        let res = timeout(Duration::from_secs(3), socket.recv_from(&mut res_buffer.buf)).await;
+
+        let (_len, _src) = match res {
+            Ok(Ok(val)) => val,
+            Ok(Err(e)) => return Err(format!("Ошибка сокета: {}", e).into()),
             Err(_) => {
                 println!("Тайм-аут, повторяем...");
                 num_retries += 1;
@@ -62,13 +68,13 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
         }
 
         if res_packet.header.rescode == ResultCode::NXDOMAIN {
-            return Err("Домен не существует".into());
+            return Err("Домен не существует.".into());
         }
-        
+
         if let Some(cname_record) = res_packet.answers.iter().find_map(|rec| {
             if let DnsRecord::CNAME { domain, host, .. } = rec {
                 if qname.ends_with(domain) {
-                    return Some(host.clone()); 
+                    return Some(host.clone());
                 }
             }
             None
@@ -108,13 +114,11 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
             continue;
         }
         
-        return Err("Не найдено ответов, CNAME или NS-записей".into());
+        return Err("Не найдено ответов, CNAME или NS-записей.".into());
     }
 }
 
-
-async fn handle_query(socket: &UdpSocket, src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<()> {
-    // Парсим входящий запрос
+async fn handle_query(src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<()> {
     let req_packet = DnsPacket::from_buffer(&mut req_buffer.clone())?;
     
     let mut res_packet = DnsPacket::new();
@@ -123,7 +127,6 @@ async fn handle_query(socket: &UdpSocket, src: SocketAddr, req_buffer: BytePacke
     res_packet.header.recursion_available = true;
     res_packet.header.response = true;
 
-    // Для каждого вопроса в запросе пытаемся найти ответ
     if let Some(question) = req_packet.questions.get(0) {
         println!("Получен запрос от {} для домена '{}'", src, question.name);
 
@@ -141,16 +144,17 @@ async fn handle_query(socket: &UdpSocket, src: SocketAddr, req_buffer: BytePacke
             }
         }
     } else {
-        // Если в запросе нет вопросов, возвращаем FORMERR
         res_packet.header.rescode = ResultCode::FORMERR;
     }
 
-    // Отправляем ответ обратно клиенту
     let mut res_buffer = BytePacketBuffer::new();
     res_packet.write(&mut res_buffer)?;
 
     let res_bytes = res_buffer.get_range(0, res_buffer.pos())?;
-    socket.send_to(res_bytes, src).await?;
+    
+    // Создаем новый сокет для отправки ответа, чтобы избежать ошибки clone()
+    let send_socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
+    send_socket.send_to(res_bytes, src).await?;
 
     Ok(())
 }
@@ -162,20 +166,16 @@ async fn main() -> Result<()> {
 
     let mut buffer = BytePacketBuffer::new();
     loop {
-        // Ожидаем входящий запрос
         let (len, src) = socket.recv_from(&mut buffer.buf).await?;
 
-        // Создаем новую задачу (task) для асинхронной обработки запроса
-        let local_socket = socket.clone();
-        let local_buffer = buffer.clone();
-
+        // Захватываем буфер и источник для передачи в задачу
+        let req_buffer = buffer.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_query(&local_socket, src, local_buffer).await {
+            if let Err(e) = handle_query(src, req_buffer).await {
                 eprintln!("Ошибка при обработке запроса: {}", e);
             }
         });
         
-        // Сбрасываем буфер для следующего запроса
         buffer = BytePacketBuffer::new();
     }
 }
