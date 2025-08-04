@@ -103,7 +103,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
                 nameserver = a_record;
             } else {
                 println!("'Клейкой записи' нет, выполняем рекурсивный поиск для NS: {}", ns_record);
-                let ns_ip_packet = lookup(&ns_record, QueryType::A).await?;
+                let ns_ip_packet = lookup(ns_record, QueryType::A).await?;
                 if let Some(ns_ip) = ns_ip_packet.get_random_a() {
                     nameserver = ns_ip;
                 } else {
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 
     let mut buffer = BytePacketBuffer::new();
     loop {
-        let (len, src) = socket.recv_from(&mut buffer.buf).await?;
+        let (_len, src) = socket.recv_from(&mut buffer.buf).await?;
 
         let req_buffer = buffer.clone();
         tokio::spawn(async move {
