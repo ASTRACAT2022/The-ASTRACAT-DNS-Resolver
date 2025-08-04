@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+// src/main.rs
+
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -11,7 +13,6 @@ use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-// Используем Arc<Mutex<_>> для безопасного доступа к кэшу в нескольких потоках
 type Cache = Arc<Mutex<HashMap<String, (IpAddr, Instant)>>>;
 
 const CACHE_LIFETIME_SECONDS: u64 = 3600;
@@ -20,8 +21,8 @@ const ROOT_SERVER: &str = "198.41.0.4";
 const UDP_TIMEOUT_MS: u64 = 2000;
 const SERVER_PORT: u16 = 5353;
 
-/// Тип для рекурсивного асинхронного поиска.
-type RecursiveLookupFuture = Pin<Box<dyn std::future::Future<Output = Result<IpAddr, Box<dyn std::error::Error>>> + Send>>;
+// Тип для асинхронного поиска.
+type LookupFuture = Pin<Box<dyn std::future::Future<Output = Result<IpAddr, Box<dyn std::error::Error>>> + Send>>;
 
 /// Создает DNS-сообщение для запроса.
 fn create_query_message(
@@ -42,7 +43,6 @@ async fn send_and_receive_udp(
     server_addr: &IpAddr,
     query_message: &Message,
 ) -> Result<Message, Box<dyn std::error::Error>> {
-    // Биндимся на [::]:0 для поддержки как IPv4, так и IPv6
     let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await?;
     let buffer = query_message.to_vec()?;
     let server_socket_addr = SocketAddr::new(*server_addr, 53);
@@ -62,18 +62,13 @@ async fn send_and_receive_udp(
     }
 }
 
-/// Рекурсивный поиск DNS с кэшированием.
-fn recursive_lookup_with_cache(
+/// Итеративный поиск DNS с кэшированием.
+fn iterative_lookup_with_cache(
     name: Name,
     record_type: RecordType,
     cache: Cache,
-    depth: u32,
-) -> RecursiveLookupFuture {
+) -> LookupFuture {
     Box::pin(async move {
-        if depth > MAX_RECURSION_DEPTH {
-            return Err("Maximum recursion depth exceeded".into());
-        }
-
         let cache_key = name.to_string();
         if let Some((addr, timestamp)) = cache.lock().unwrap().get(&cache_key) {
             if timestamp.elapsed().as_secs() < CACHE_LIFETIME_SECONDS {
@@ -84,13 +79,23 @@ fn recursive_lookup_with_cache(
             }
         }
 
-        info!("Attempting to resolve {} (depth: {})", name, depth);
+        info!("Starting iterative lookup for {}", name);
 
         let mut current_server = IpAddr::V4(ROOT_SERVER.parse()?);
-        let mut resolved_address: Option<IpAddr> = None;
+        let mut lookup_name = name.clone();
+        let mut visited_servers = HashSet::new();
+        let mut depth = 0;
 
         loop {
-            let query_message = create_query_message(&name, record_type, 1)?;
+            if depth > MAX_RECURSION_DEPTH {
+                return Err("Maximum recursion depth exceeded".into());
+            }
+
+            if !visited_servers.insert(current_server) {
+                return Err("Detected a DNS server loop".into());
+            }
+
+            let query_message = create_query_message(&lookup_name, record_type, 1)?;
             let response_message = match send_and_receive_udp(&current_server, &query_message).await {
                 Ok(msg) => msg,
                 Err(e) => {
@@ -105,33 +110,27 @@ fn recursive_lookup_with_cache(
                 _ => return Err(format!("DNS error: {:?}", response_message.response_code()).into()),
             }
 
-            if let Some(ip) = process_answers(&response_message, &name, record_type) {
-                resolved_address = Some(ip);
-                cache
-                    .lock()
-                    .unwrap()
-                    .insert(cache_key.clone(), (ip, Instant::now()));
-                break;
+            if let Some(ip) = process_answers(&response_message, &lookup_name, record_type) {
+                cache.lock().unwrap().insert(cache_key.clone(), (ip, Instant::now()));
+                info!("Successfully resolved {} to {}", lookup_name, ip);
+                return Ok(ip);
             }
 
             if let Some(cname_record) = response_message
                 .answers()
                 .iter()
-                .find(|r| r.name() == &name && r.record_type() == RecordType::CNAME)
+                .find(|r| r.name() == &lookup_name && r.record_type() == RecordType::CNAME)
                 .and_then(|r| r.data().as_cname())
             {
                 let cname_name = cname_record.0.clone();
                 info!(
-                    "Received CNAME for '{}', recursing with '{}'",
-                    name, cname_name
+                    "Received CNAME for '{}', continuing with '{}'",
+                    lookup_name, cname_name
                 );
-                return Box::pin(recursive_lookup_with_cache(
-                    cname_name,
-                    record_type,
-                    Arc::clone(&cache),
-                    depth + 1,
-                ))
-                .await;
+                lookup_name = cname_name;
+                depth += 1;
+                // Continue the loop with the new name
+                continue;
             }
 
             if let Some(ns_record) = response_message
@@ -143,43 +142,47 @@ fn recursive_lookup_with_cache(
                 let ns_name = ns_record.0.clone();
                 info!("Received NS record: {}", ns_name);
 
+                let mut new_server_ip: Option<IpAddr> = None;
                 if let Some(additional_record) = response_message.additionals().iter().find(|r| {
-                    *r.name() == ns_name
-                        && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA)
+                    *r.name() == ns_name && (r.record_type() == RecordType::A || r.record_type() == RecordType::AAAA)
                 }) {
                     if let Some(ns_ip) = get_ip_from_rdata(additional_record.data()) {
-                        current_server = ns_ip;
-                        info!("Found additional record IP for NS: {}", current_server);
-                        continue;
+                        new_server_ip = Some(ns_ip);
                     }
                 }
 
-                info!("No additional record for NS server, doing recursive lookup for IP");
-                match Box::pin(recursive_lookup_with_cache(
-                    ns_name.clone(),
-                    RecordType::A,
-                    Arc::clone(&cache),
-                    depth + 1,
-                ))
-                .await
-                {
-                    Ok(ip) => {
-                        current_server = ip;
-                        info!("Resolved NS server IP: {}", current_server);
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Failed to resolve NS server {}: {}", ns_name, e);
-                        return Err(e);
+                if let Some(ip) = new_server_ip {
+                    current_server = ip;
+                    info!("Found glue record IP for NS: {}", current_server);
+                } else {
+                    info!("No glue record for NS server, doing lookup for its IP");
+                    match Box::pin(iterative_lookup_with_cache(
+                        ns_name.clone(),
+                        RecordType::A,
+                        Arc::clone(&cache),
+                    ))
+                    .await
+                    {
+                        Ok(ip) => {
+                            current_server = ip;
+                            info!("Resolved NS server IP: {}", current_server);
+                        }
+                        Err(e) => {
+                            error!("Failed to resolve NS server {}: {}", ns_name, e);
+                            return Err(e);
+                        }
                     }
                 }
+                depth += 1;
+                // Continue the loop with the new server
+                continue;
             }
 
-            warn!("No answers or referrals received. Giving up on {}", name);
+            warn!("No answers or referrals received. Giving up on {}", lookup_name);
             break;
         }
 
-        resolved_address.ok_or_else(|| "Failed to find a valid IP address".into())
+        Err("Failed to find a valid IP address".into())
     })
 }
 
@@ -216,7 +219,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let cache = Arc::new(Mutex::new(HashMap::new()));
-    // Биндимся на [::]:5353 для поддержки как IPv4, так и IPv6
     let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, SERVER_PORT)).await?;
 
     info!("DNS-сервер запущен на 127.0.0.1:{}", SERVER_PORT);
@@ -234,7 +236,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match Message::from_vec(&request_bytes) {
                 Ok(request_message) => {
-                    // Создаем ответное сообщение с правильными ID и OpCode сразу
                     response_message = Message::new(
                         request_message.id(),
                         MessageType::Response,
@@ -242,14 +243,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     
                     if let Some(query) = request_message.queries().get(0) {
-                        info!("Starting recursive lookup for '{}'", query.name());
+                        info!("Starting iterative lookup for '{}'", query.name());
                         response_message.add_query(query.clone());
 
-                        match Box::pin(recursive_lookup_with_cache(
+                        match Box::pin(iterative_lookup_with_cache(
                             query.name().clone(),
                             query.query_type(),
                             cache_clone,
-                            0,
                         ))
                         .await
                         {
@@ -280,7 +280,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => {
                     error!("Failed to parse DNS query from '{}'. Reason: {}", src, e);
                     response_code = ResponseCode::FormErr;
-                    // Создаем сообщение по умолчанию для некорректного пакета
                     response_message = Message::new(0, MessageType::Response, OpCode::Query);
                 }
             }
