@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dns::{
@@ -30,7 +31,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
         }
         depth += 1;
 
-        println!("Выполняем поиск '{}' на сервере {}", qname, nameserver);
+        // println!("Выполняем поиск '{}' на сервере {}", qname, nameserver);
 
         let mut packet = DnsPacket::new();
         packet.header.id = 6666;
@@ -54,7 +55,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
             Ok(Ok(val)) => val,
             Ok(Err(e)) => return Err(format!("Ошибка сокета: {}", e).into()),
             Err(_) => {
-                println!("Тайм-аут, повторяем...");
+                // println!("Тайм-аут, повторяем...");
                 continue;
             }
         };
@@ -62,7 +63,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
         let res_packet = DnsPacket::from_buffer(&mut res_buffer)?;
 
         if !res_packet.answers.is_empty() {
-            println!("Найден ответ!");
+            // println!("Найден ответ!");
             return Ok(res_packet);
         }
 
@@ -79,7 +80,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
             }
             None
         }) {
-            println!("Получен CNAME, обновляем имя для поиска: {}", cname_record);
+            // println!("Получен CNAME, обновляем имя для поиска: {}", cname_record);
             qname = cname_record;
             // Переходим на следующую итерацию с новым именем
             continue;
@@ -101,10 +102,10 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
                 }
                 None
             }) {
-                println!("Найдена 'клейкая запись' для NS: {}", a_record);
+                // println!("Найдена 'клейкая запись' для NS: {}", a_record);
                 nameserver = a_record;
             } else {
-                println!("'Клейкой записи' нет, выполняем рекурсивный поиск для NS: {}", ns_record);
+                // println!("'Клейкой записи' нет, выполняем рекурсивный поиск для NS: {}", ns_record);
                 let ns_ip_packet = lookup(ns_record.clone(), QueryType::A).await?;
                 if let Some(ns_ip) = ns_ip_packet.get_random_a() {
                     nameserver = ns_ip;
@@ -119,7 +120,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
     }
 }
 
-async fn handle_query(src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<()> {
+async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<()> {
     let req_packet = DnsPacket::from_buffer(&mut req_buffer.clone())?;
     
     let mut res_packet = DnsPacket::new();
@@ -129,7 +130,7 @@ async fn handle_query(src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<(
     res_packet.header.response = true;
 
     if let Some(question) = req_packet.questions.get(0) {
-        println!("Получен запрос от {} для домена '{}'", src, question.name);
+        // println!("Получен запрос от {} для домена '{}'", src, question.name);
         res_packet.questions.push(question.clone());
 
         match lookup(question.name.clone(), question.qtype).await {
@@ -152,24 +153,25 @@ async fn handle_query(src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<(
 
     let res_bytes = res_buffer.get_range(0, res_buffer.pos())?;
     
-    let send_socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
-    send_socket.send_to(res_bytes, src).await?;
+    socket.send_to(res_bytes, src).await?;
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let socket = UdpSocket::bind(("0.0.0.0", 53)).await?;
-    println!("DNS-сервер запущен на порту 53");
+    let socket = UdpSocket::bind(("0.0.0.0", 5300)).await?;
+    let shared_socket = Arc::new(socket);
+    println!("DNS-сервер запущен на порту 5300");
 
     let mut buffer = BytePacketBuffer::new();
     loop {
-        let (_len, src) = socket.recv_from(&mut buffer.buf).await?;
-
+        let (len, src) = shared_socket.recv_from(&mut buffer.buf).await?;
+        
         let req_buffer = buffer.clone();
+        let socket_clone = Arc::clone(&shared_socket);
         tokio::spawn(async move {
-            if let Err(e) = handle_query(src, req_buffer).await {
+            if let Err(e) = handle_query(socket_clone, src, req_buffer).await {
                 eprintln!("Ошибка при обработке запроса: {}", e);
             }
         });
