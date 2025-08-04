@@ -1,5 +1,6 @@
 use super::Result;
 
+#[derive(Clone)]
 pub struct BytePacketBuffer {
     pub buf: [u8; 512],
     pub pos: usize,
@@ -76,22 +77,13 @@ impl BytePacketBuffer {
         let max_jumps = 5;
         let mut jumps_performed = 0;
         loop {
-            // Dns Packets are untrusted data, so we need to be paranoid. Someone
-            // can craft a packet with a cycle in the jump instructions. This guards
-            // against such packets.
             if jumps_performed > max_jumps {
                 return Err(format!("Limit of {} jumps exceeded", max_jumps).into());
             }
 
             let len = self.get(pos)?;
 
-            // A two byte sequence, where the two highest bits of the first byte is
-            // set, represents a offset relative to the start of the buffer. We
-            // handle this by jumping to the offset, setting a flag to indicate
-            // that we shouldn't update the shared buffer position once done.
             if (len & 0xC0) == 0xC0 {
-                // When a jump is performed, we only modify the shared buffer
-                // position once, and avoid making the change later on.
                 if !jumped {
                     self.seek(pos + 2)?;
                 }
@@ -106,7 +98,6 @@ impl BytePacketBuffer {
 
             pos += 1;
 
-            // Names are terminated by an empty label of length 0
             if len == 0 {
                 break;
             }
