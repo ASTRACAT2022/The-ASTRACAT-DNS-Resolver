@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 use std::io;
 use std::future::Future;
 use std::pin::Pin;
+use std::collections::HashSet; // Для обнаружения циклов
 
 use log::{info, error, trace, warn};
 use hickory_proto::op::{Message, ResponseCode, Query};
-use hickory_proto::rr::{Record, RecordType, RData};
+use hickory_proto::rr::{Record, RecordType, RData, Name};
 use hickory_proto::serialize::binary::{BinEncoder, BinDecoder, BinEncodable, BinDecodable};
 use anyhow::{Result, Context};
 use rand::random;
@@ -25,6 +26,8 @@ const DNS_PORT: u16 = 5353;
 const DNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Minimum remaining TTL to trigger prefetching
 const PREFETCH_THRESHOLD: Duration = Duration::from_secs(60);
+/// Max recursion depth to prevent infinite loops
+const MAX_RECURSION_DEPTH: u8 = 10;
 
 // Root DNS servers
 const ROOT_SERVERS: &[Ipv4Addr] = &[
@@ -54,12 +57,10 @@ type Cache = Arc<DashMap<(String, RecordType), CacheEntry>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     env_logger::init();
     
     info!("Starting DNS resolver on 0.0.0.0:{}", DNS_PORT);
 
-    // Create a UDP socket and a shared cache
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT);
     let sock = Arc::new(UdpSocket::bind(bind_addr).await
         .with_context(|| format!("Failed to bind to {}", bind_addr))?);
@@ -67,19 +68,15 @@ async fn main() -> Result<()> {
 
     info!("Listening on {}", bind_addr);
 
-    // Start a background task for cache cleanup and prefetching
     let cache_clone_prefetch = Arc::clone(&cache);
     tokio::spawn(async move {
         loop {
-            // Retain entries that have not expired
             let now = Instant::now();
             cache_clone_prefetch.retain(|_, v| v.expires_at > now);
 
-            // Iterate through the cache to prefetch expiring records
             for entry in cache_clone_prefetch.iter() {
                 if let Some(time_left) = entry.expires_at.checked_duration_since(now) {
                     if time_left < PREFETCH_THRESHOLD {
-                        // Clone the key data to move into the async task
                         let key = entry.key().clone();
                         let name_str = key.0;
                         let record_type = key.1;
@@ -89,17 +86,15 @@ async fn main() -> Result<()> {
                             return hickory_proto::rr::Name::from_ascii(".").unwrap();
                         });
                         
-                        let name_for_log = name_str.clone(); // Clone for use in the log message
+                        let name_for_log = name_str.clone();
                         info!("Prefetching expiring record for '{}' (type {})", name_for_log, record_type);
                         
                         let cache_clone_inner = Arc::clone(&cache_clone_prefetch);
                         tokio::spawn(async move {
-                            // Pass the Arc by value to the recursive lookup function.
-                            if let Ok((answers, _)) = recursive_lookup_with_cache(name_owned, record_type, cache_clone_inner.clone(), 0).await {
+                            if let Ok((answers, _)) = iterative_lookup_with_cache(name_owned, record_type, cache_clone_inner.clone()).await {
                                 if !answers.is_empty() {
                                     let min_ttl = answers.iter().map(|r| r.ttl()).min().unwrap_or(0);
                                     let expires_at = Instant::now() + Duration::from_secs(min_ttl.into());
-                                    // Use the cloned name_str and record_type
                                     cache_clone_inner.insert((name_str.clone(), record_type), CacheEntry { records: answers, expires_at });
                                     info!("Successfully prefetched and updated cache for '{}'", name_str);
                                 }
@@ -112,7 +107,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Main server loop to handle incoming requests
     let mut buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
     loop {
         let (len, addr) = tokio::select! {
@@ -127,7 +121,6 @@ async fn main() -> Result<()> {
         let cache_clone = Arc::clone(&cache);
         let request_bytes_owned = buf[..len].to_vec();
         
-        // Spawn a task to handle each query asynchronously
         tokio::spawn(async move {
             match handle_query(&request_bytes_owned, &cache_clone).await {
                 Ok(response_message) => {
@@ -142,7 +135,6 @@ async fn main() -> Result<()> {
                 },
                 Err(e) => {
                     error!("Error handling query from {}: {}", addr, e);
-                    // Create an error response message
                     if let Ok(request_message) = Message::from_vec(&request_bytes_owned) {
                         let failure_message = Message::error_msg(
                             request_message.header().id(),
@@ -176,7 +168,6 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
     let questions = request_message.queries();
     if questions.is_empty() {
         warn!("Received a DNS request with no questions.");
-        // Use the correct constructor for a response message
         let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
         response_message.set_recursion_available(true);
         return Ok(response_message);
@@ -186,7 +177,6 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
     
     info!("Received a query for '{}' (type {})", query.name(), query.query_type());
 
-    // Check the cache first
     let cache_key = (query.name().to_string(), query.query_type());
     if let Some(entry) = cache.get(&cache_key) {
         if entry.expires_at > Instant::now() {
@@ -204,11 +194,9 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
         }
     }
     
-    // Perform recursive lookup
-    let (answers, authorities) = recursive_lookup_with_cache(query.name().clone(), query.query_type(), Arc::clone(&cache), 0).await
-        .context("Recursive lookup failed")?;
+    let (answers, authorities) = iterative_lookup_with_cache(query.name().clone(), query.query_type(), Arc::clone(&cache)).await
+        .context("Iterative lookup failed")?;
 
-    // Build the response message
     let mut response_message = Message::response(request_message.header().id(), request_message.op_code());
     response_message.set_recursion_available(true);
     
@@ -229,41 +217,48 @@ async fn handle_query(request_bytes: &[u8], cache: &Cache) -> Result<Message> {
     Ok(response_message)
 }
 
-/// Performs a manual recursive DNS lookup starting from root servers.
-fn recursive_lookup_with_cache(
-    name: hickory_proto::rr::Name,
+/// Performs a manual iterative DNS lookup starting from root servers.
+fn iterative_lookup_with_cache(
+    name: Name,
     record_type: RecordType,
-    // Pass the Cache Arc by value to enable a 'static lifetime for the future.
     cache: Cache,
-    depth: u8,
 ) -> Pin<Box<dyn Future<Output = Result<(Vec<Record>, Vec<Record>)>> + Send + 'static>> {
     Box::pin(async move {
-        if depth > 10 {
-            error!("Max recursion depth reached for '{}'", name);
-            return Ok((vec![], vec![]));
-        }
-
         let mut current_servers: Vec<IpAddr> = ROOT_SERVERS.iter().map(|&ip| IpAddr::V4(ip)).collect();
-        
+        let mut lookup_name = name.clone();
+        let mut visited_servers = HashSet::new();
+        let mut depth = 0;
+
         loop {
+            if depth > MAX_RECURSION_DEPTH {
+                error!("Max recursion depth reached for '{}'", lookup_name);
+                return Err(io::Error::new(io::ErrorKind::Other, "Max recursion depth reached").into());
+            }
+
+            // Добавляем текущие серверы в набор посещенных, чтобы избежать циклов
+            for server in &current_servers {
+                if !visited_servers.insert(*server) {
+                    error!("Detected DNS server loop for '{}'", lookup_name);
+                    return Err(io::Error::new(io::ErrorKind::Other, "Detected DNS server loop").into());
+                }
+            }
+
             let mut request = Message::query();
             let mut header = request.header().clone();
             header.set_id(random());
             header.set_recursion_desired(false);
             request.set_header(header);
             
-            let query = Query::query(name.clone(), record_type);
+            let query = Query::query(lookup_name.clone(), record_type);
             request.add_query(query);
             
             let mut request_bytes = Vec::new();
             let mut encoder = BinEncoder::new(&mut request_bytes);
             request.emit(&mut encoder)?;
     
-            // Send queries to all current nameservers in parallel
             let mut futures = Vec::new();
             for server_ip in &current_servers {
                 let server_addr = SocketAddr::new(*server_ip, 53);
-                // Pass the SocketAddr by value to avoid lifetime issues.
                 futures.push(send_udp_query(&request_bytes, server_addr));
             }
 
@@ -292,33 +287,30 @@ fn recursive_lookup_with_cache(
             };
     
             if !response.answers().is_empty() {
-                // We found the final answer
                 let answers = response.answers().to_vec();
+                let authorities = response.name_servers().to_vec();
                 if let Some(min_ttl) = answers.iter().map(|r| r.ttl()).min() {
                     let expires_at = Instant::now() + Duration::from_secs(min_ttl.into());
-                    cache.insert((name.to_string(), record_type), CacheEntry { records: answers.clone(), expires_at });
+                    cache.insert((lookup_name.to_string(), record_type), CacheEntry { records: answers.clone(), expires_at });
                 }
                 
-                return Ok((answers, response.name_servers().to_vec()));
+                return Ok((answers, authorities));
             }
 
-            // Handle CNAME records correctly
             if let Some(rec) = response.answers().iter().find(|rec| rec.record_type() == RecordType::CNAME) {
-                // Pattern match directly on the RData enum since `data()` returns &RData, not Option<&RData>
                 if let Some(RData::CNAME(cname_name_record)) = rec.data() {
-                    info!("Received CNAME for '{}', recursing with '{}'", name, cname_name_record.0);
-                    // Clone the cache Arc for the recursive call.
-                    return recursive_lookup_with_cache(cname_name_record.0.clone(), record_type, Arc::clone(&cache), depth + 1).await;
+                    info!("Received CNAME for '{}', continuing with '{}'", lookup_name, cname_name_record.0);
+                    lookup_name = cname_name_record.0.clone();
+                    depth += 1;
+                    continue;
                 }
             }
     
-            // Handle referrals if there are authority records
             if !response.name_servers().is_empty() {
                 let mut new_servers = Vec::new();
                 let mut ns_names = Vec::new();
                 
                 for record in response.name_servers() {
-                    // Pattern match directly on the RData enum
                     if let Some(RData::NS(ns_name_record)) = record.data() {
                         ns_names.push(ns_name_record.0.clone());
                         for additional_record in response.additionals() {
@@ -334,8 +326,7 @@ fn recursive_lookup_with_cache(
                 if new_servers.is_empty() {
                     info!("Glue records not found, performing new lookups for NS servers.");
                     for ns_name in &ns_names {
-                        // Clone the cache Arc for the recursive call.
-                        match recursive_lookup_with_cache(ns_name.clone(), RecordType::A, Arc::clone(&cache), depth + 1).await {
+                        match iterative_lookup_with_cache(ns_name.clone(), RecordType::A, Arc::clone(&cache)).await {
                             Ok((answers, _)) => {
                                 for answer in answers {
                                     if let Some(ip) = extract_ip_from_rdata(answer.data()) {
@@ -355,7 +346,9 @@ fn recursive_lookup_with_cache(
     
                 current_servers = new_servers;
                 info!("Following referral to new servers: {:?}", current_servers);
+                depth += 1;
             } else {
+                warn!("No answers or referrals for '{}'", lookup_name);
                 return Ok((vec![], response.name_servers().to_vec()));
             }
         }
@@ -376,7 +369,6 @@ async fn send_udp_query(request_bytes: &[u8], server_addr: SocketAddr) -> Result
 /// Helper function to extract an IpAddr from RData
 fn extract_ip_from_rdata(rdata: &RData) -> Option<IpAddr> {
     match rdata {
-        // Pattern match directly on the inner values of the RData tuple structs
         RData::A(ipv4_rdata) => Some(IpAddr::V4(ipv4_rdata.0)),
         RData::AAAA(ipv6_rdata) => Some(IpAddr::V6(ipv6_rdata.0)),
         _ => None,
