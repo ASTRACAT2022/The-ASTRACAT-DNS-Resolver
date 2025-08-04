@@ -12,11 +12,13 @@ use crate::dns::{
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use async_recursion::async_recursion;
 
 mod dns;
 
 const ROOT_SERVER: Ipv4Addr = Ipv4Addr::new(198, 41, 0, 4);
 
+#[async_recursion]
 async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
     let mut nameserver = ROOT_SERVER;
     const MAX_DEPTH: u8 = 10;
