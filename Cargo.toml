@@ -7,5 +7,5 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 async-recursion = "1.0.2"
-prometheus-exporter = "0.8"
+prometheus_exporter = "0.8"
 lazy_static = "1.4.0"
