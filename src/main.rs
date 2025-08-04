@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use crate::dns::{
     byte_packet_buffer::BytePacketBuffer,
-    dns_header::DnsHeader,
     dns_packet::DnsPacket,
     dns_question::DnsQuestion,
     dns_record::DnsRecord,
@@ -17,17 +16,17 @@ use tokio::time::timeout;
 mod dns;
 
 const ROOT_SERVER: Ipv4Addr = Ipv4Addr::new(198, 41, 0, 4);
-const MAX_RETRIES: u8 = 5;
 
-// Логика итеративного поиска
-async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
+async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
     let mut nameserver = ROOT_SERVER;
-    let mut num_retries = 0;
+    const MAX_DEPTH: u8 = 10;
+    let mut depth = 0;
 
     loop {
-        if num_retries >= MAX_RETRIES {
-            return Err("Превышено максимальное количество попыток.".into());
+        if depth >= MAX_DEPTH {
+            return Err("Превышена максимальная глубина поиска.".into());
         }
+        depth += 1;
 
         println!("Выполняем поиск '{}' на сервере {}", qname, nameserver);
 
@@ -37,13 +36,12 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
         packet.header.questions = 1;
         packet
             .questions
-            .push(DnsQuestion::new(qname.to_string(), qtype));
+            .push(DnsQuestion::new(qname.clone(), qtype));
 
         let mut req_buffer = BytePacketBuffer::new();
         packet.write(&mut req_buffer)?;
         let req_bytes = req_buffer.get_range(0, req_buffer.pos())?;
 
-        // Создаем новый временный сокет для отправки запроса
         let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
         socket.send_to(req_bytes, (nameserver, 53)).await?;
 
@@ -55,7 +53,6 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
             Ok(Err(e)) => return Err(format!("Ошибка сокета: {}", e).into()),
             Err(_) => {
                 println!("Тайм-аут, повторяем...");
-                num_retries += 1;
                 continue;
             }
         };
@@ -71,6 +68,7 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
             return Err("Домен не существует.".into());
         }
 
+        // Итеративная обработка CNAME
         if let Some(cname_record) = res_packet.answers.iter().find_map(|rec| {
             if let DnsRecord::CNAME { domain, host, .. } = rec {
                 if qname.ends_with(domain) {
@@ -79,8 +77,10 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
             }
             None
         }) {
-            println!("Получен CNAME, перезапускаем поиск для {}", cname_record);
-            return lookup(&cname_record, qtype).await;
+            println!("Получен CNAME, обновляем имя для поиска: {}", cname_record);
+            qname = cname_record;
+            // Переходим на следующую итерацию с новым именем
+            continue;
         }
 
         if let Some(ns_record) = res_packet.authorities.iter().find_map(|rec| {
@@ -110,10 +110,9 @@ async fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
                     return Err(format!("Не удалось разрешить NS-запись для {}", ns_record).into());
                 }
             }
-            num_retries = 0;
             continue;
         }
-        
+
         return Err("Не найдено ответов, CNAME или NS-записей.".into());
     }
 }
@@ -129,10 +128,9 @@ async fn handle_query(src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<(
 
     if let Some(question) = req_packet.questions.get(0) {
         println!("Получен запрос от {} для домена '{}'", src, question.name);
-
         res_packet.questions.push(question.clone());
 
-        match lookup(&question.name, question.qtype).await {
+        match lookup(question.name.clone(), question.qtype).await {
             Ok(answers) => {
                 res_packet.header.rescode = ResultCode::NOERROR;
                 res_packet.answers = answers.answers;
@@ -152,7 +150,6 @@ async fn handle_query(src: SocketAddr, req_buffer: BytePacketBuffer) -> Result<(
 
     let res_bytes = res_buffer.get_range(0, res_buffer.pos())?;
     
-    // Создаем новый сокет для отправки ответа, чтобы избежать ошибки clone()
     let send_socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
     send_socket.send_to(res_bytes, src).await?;
 
@@ -168,7 +165,6 @@ async fn main() -> Result<()> {
     loop {
         let (len, src) = socket.recv_from(&mut buffer.buf).await?;
 
-        // Захватываем буфер и источник для передачи в задачу
         let req_buffer = buffer.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_query(src, req_buffer).await {
