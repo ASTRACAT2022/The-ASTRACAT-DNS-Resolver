@@ -103,7 +103,7 @@ async fn lookup(mut qname: String, qtype: QueryType) -> Result<DnsPacket> {
                 nameserver = a_record;
             } else {
                 println!("'Клейкой записи' нет, выполняем рекурсивный поиск для NS: {}", ns_record);
-                let ns_ip_packet = lookup(ns_record, QueryType::A).await?;
+                let ns_ip_packet = lookup(ns_record.clone(), QueryType::A).await?;
                 if let Some(ns_ip) = ns_ip_packet.get_random_a() {
                     nameserver = ns_ip;
                 } else {
