@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::time::sleep;
 use rand::seq::SliceRandom;
 use async_recursion::async_recursion;
 use lazy_static::lazy_static;
@@ -95,18 +95,20 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
         let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
         socket.send_to(req_bytes, (current_nameserver, 53)).await?;
 
+        // Используем select! для таймаута recv_from
         let mut res_buffer = BytePacketBuffer::new();
-        let res = timeout(Duration::from_secs(3), socket.recv_from(&mut res_buffer.buf)).await;
-
-        let (_len, _src) = match res {
-            Ok(Ok(val)) => val,
-            Ok(Err(e)) => return Err(format!("Ошибка сокета: {}", e).into()),
-            Err(_) => {
-                // Тайм-аут, пробуем другой корневой сервер
+        let mut buf = res_buffer.buf;
+        tokio::select! {
+            recv = socket.recv_from(&mut buf) => {
+                let (len, _src) = recv?;
+                res_buffer.buf[..len].copy_from_slice(&buf[..len]);
+            }
+            _ = sleep(Duration::from_secs(3)) => {
+                // Таймаут: выбираем другой корневой сервер и продолжаем
                 current_nameserver = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
                 continue;
             }
-        };
+        }
 
         let res_packet = DnsPacket::from_buffer(&mut res_buffer)?;
 
@@ -212,7 +214,7 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
             }
         }
     } else {
-    res_packet.header.rescode = ResultCode::FORMERR;
+        res_packet.header.rescode = ResultCode::FORMERR;
     }
 
     let mut res_buffer = BytePacketBuffer::new();
