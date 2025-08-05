@@ -38,79 +38,6 @@ lazy_static::lazy_static! {
         Arc::new(parking_lot::RwLock::new(HashMap::new()));
 }
 
-// Реализация методов для DnsPacket
-impl DnsPacket {
-    /// Возвращает случайный IP-адрес из записей типа A в разделе ответов.
-    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
-        self.answers
-            .iter()
-            .filter_map(|rec| {
-                if let DnsRecord::A { addr, .. } = rec {
-                    Some(*addr)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<Ipv4Addr>>()
-            .choose(&mut rand::thread_rng())
-            .copied()
-    }
-
-    /// Ищет авторитативный сервер имен (NS) в разделе авторитетных записей.
-    /// Возвращает имя хоста наиболее подходящего NS-сервера.
-    pub fn get_authoritative_ns(&self, qname: &str) -> Option<String> {
-        let mut best_match: Option<String> = None;
-        let mut longest_match_len = 0;
-
-        for rec in &self.authorities {
-            if let DnsRecord::NS { domain, host, .. } = rec {
-                if qname.ends_with(domain) {
-                    if domain.len() > longest_match_len {
-                        longest_match_len = domain.len();
-                        best_match = Some(host.clone());
-                    }
-                }
-            }
-        }
-        best_match
-    }
-
-    /// Вспомогательный метод для поиска NS-записей, соответствующих домену.
-    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
-        self.authorities
-            .iter()
-            .filter_map(|rec| {
-                if let DnsRecord::NS { domain, host, .. } = rec {
-                    if qname.ends_with(domain) {
-                        Some((domain.as_str(), host.as_str()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-    }
-
-    /// Ищет IP-адрес NS-сервера в дополнительном разделе на основе имени хоста NS-сервера.
-    pub fn get_ns_ip_from_additional(&self, qname: &str) -> Option<Ipv4Addr> {
-        self.get_ns(qname)
-            .flat_map(|(_, host)| {
-                self.resources
-                    .iter()
-                    .filter_map(move |record| {
-                        if let DnsRecord::A { domain, addr, .. } = record {
-                            if domain == host {
-                                return Some(*addr);
-                            }
-                        }
-                        None
-                    })
-            })
-            .next()
-    }
-}
-
 #[async_recursion]
 async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Result<DnsPacket> {
     const MAX_DEPTH: u8 = 10;
@@ -184,9 +111,9 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
         }
         
         // Ищем имя авторитативного сервера и выполняем новый поиск для его IP
-        if let Some(ns_host) = res_packet.get_authoritative_ns(&qname) {
+        if let Some(ns_host) = res_packet.get_unresolved_ns(&qname) {
             let root_server = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
-            let ns_ip_packet = lookup(ns_host.clone(), QueryType::A, root_server).await?;
+            let ns_ip_packet = lookup(ns_host.to_string(), QueryType::A, root_server).await?;
             
             if let Some(ns_ip) = ns_ip_packet.get_random_a() {
                 current_nameserver = ns_ip;
