@@ -47,6 +47,9 @@ lazy_static! {
     .unwrap();
 }
 
+// Константы
+const ROOT_TIMEOUT_SECS: u64 = 2; // Уменьшенный таймаут для запросов к корневым серверам
+
 // Корневые DNS-серверы
 const ROOT_SERVERS: &[Ipv4Addr] = &[
     Ipv4Addr::new(198, 41, 0, 4),    // A
@@ -78,6 +81,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
 
     loop {
         if depth >= MAX_DEPTH {
+            eprintln!("[lookup] Превышена максимальная глубина поиска для {}", qname);
             return Err("Превышена максимальная глубина поиска.".into());
         }
         depth += 1;
@@ -95,16 +99,19 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
         let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
         socket.send_to(req_bytes, (current_nameserver, 53)).await?;
 
-        // Используем select! для таймаута recv_from
+        // Таймаут через select!
         let mut res_buffer = BytePacketBuffer::new();
         let mut buf = res_buffer.buf;
         tokio::select! {
             recv = socket.recv_from(&mut buf) => {
-                let (len, _src) = recv?;
+                let (len, _src) = recv.map_err(|e| {
+                    eprintln!("[lookup] Ошибка recv_from: {}", e);
+                    e
+                })?;
                 res_buffer.buf[..len].copy_from_slice(&buf[..len]);
             }
-            _ = sleep(Duration::from_secs(3)) => {
-                // Таймаут: выбираем другой корневой сервер и продолжаем
+            _ = sleep(Duration::from_secs(ROOT_TIMEOUT_SECS)) => {
+                eprintln!("[lookup] Таймаут {}с при запросе к {}", ROOT_TIMEOUT_SECS, current_nameserver);
                 current_nameserver = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
                 continue;
             }
@@ -117,6 +124,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
         }
 
         if res_packet.header.rescode == ResultCode::NXDOMAIN {
+            eprintln!("[lookup] NXDOMAIN для {}", qname);
             return Err("Домен не существует.".into());
         }
 
@@ -128,6 +136,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             }
             None
         }) {
+            eprintln!("[lookup] CNAME: {} -> {}", qname, cname_record);
             qname = cname_record;
             continue;
         }
@@ -140,6 +149,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             }
             None
         }) {
+            eprintln!("[lookup] NS найден: {} для {}", ns_record, qname);
             if let Some(a_record) = res_packet.resources.iter().find_map(|rec| {
                 if let DnsRecord::A { domain, addr, .. } = rec {
                     if domain == &ns_record {
@@ -154,12 +164,14 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
                 if let Some(ns_ip) = ns_ip_packet.get_random_a() {
                     current_nameserver = ns_ip;
                 } else {
+                    eprintln!("[lookup] Не удалось разрешить NS-запись для {}", ns_record);
                     return Err(format!("Не удалось разрешить NS-запись для {}", ns_record).into());
                 }
             }
             continue;
         }
 
+        eprintln!("[lookup] Не найдено ответов, CNAME или NS-записей для {}", qname);
         return Err("Не найдено ответов, CNAME или NS-записей.".into());
     }
 }
@@ -182,7 +194,7 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
             let cache = DNS_CACHE.read();
             if let Some((cached_packet, expiry)) = cache.get(&(question.name.clone(), question.qtype)) {
                 if expiry.elapsed() < Duration::from_secs(600) {
-                    // Кеш действителен
+                    eprintln!("[cache] HIT для {}", question.name);
                     res_packet.answers = cached_packet.answers.clone();
                     res_packet.header.rescode = ResultCode::NOERROR;
                     DNS_CACHE_HITS_TOTAL.with_label_values(&["A"]).inc();
@@ -191,10 +203,9 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
         }
 
         if res_packet.answers.is_empty() {
-            // Кеш промахнулся или устарел
+            eprintln!("[cache] MISS для {}", question.name);
             DNS_CACHE_MISSES_TOTAL.with_label_values(&["A"]).inc();
             
-            // Выбираем случайный корневой сервер
             let root_server = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
 
             match lookup(question.name.clone(), question.qtype, root_server).await {
@@ -203,12 +214,11 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
                     res_packet.answers = answers.answers.clone();
                     res_packet.header.answers = res_packet.answers.len() as u16;
                     
-                    // Добавляем в кеш
                     let mut cache = DNS_CACHE.write();
                     cache.insert((question.name.clone(), question.qtype), (answers, Instant::now()));
                 }
                 Err(e) => {
-                    eprintln!("Ошибка при разрешении домена '{}': {}", question.name, e);
+                    eprintln!("[handle_query] Ошибка при разрешении '{}': {}", question.name, e);
                     res_packet.header.rescode = ResultCode::SERVFAIL;
                 }
             }
@@ -242,7 +252,6 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Запускаем экспортер Prometheus
     let exporter_addr = "0.0.0.0:9090".parse().unwrap();
     println!("Экспортер Prometheus запущен на {}", exporter_addr);
     tokio::spawn(async move {
@@ -261,7 +270,7 @@ async fn main() -> Result<()> {
         let socket_clone = Arc::clone(&shared_socket);
         tokio::spawn(async move {
             if let Err(e) = handle_query(socket_clone, src, req_buffer).await {
-                eprintln!("Ошибка при обработке запроса: {}", e);
+                eprintln!("[main] Ошибка при обработке запроса: {}", e);
             }
         });
         
