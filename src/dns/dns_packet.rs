@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 
 use super::{
     byte_packet_buffer::BytePacketBuffer, dns_header::DnsHeader, dns_question::DnsQuestion,
@@ -39,12 +39,10 @@ impl DnsPacket {
             let rec = DnsRecord::read(buffer)?;
             result.answers.push(rec);
         }
-
         for _ in 0..result.header.authoritative_entries {
             let rec = DnsRecord::read(buffer)?;
             result.authorities.push(rec);
         }
-
         for _ in 0..result.header.resource_entries {
             let rec = DnsRecord::read(buffer)?;
             result.resources.push(rec);
@@ -64,75 +62,78 @@ impl DnsPacket {
         for question in &self.questions {
             question.write(buffer)?;
         }
-        for answer in &self.answers {
-            answer.write(buffer)?;
+        for rec in &self.answers {
+            rec.write(buffer)?;
         }
-        for auth in &self.authorities {
-            auth.write(buffer)?;
+        for rec in &self.authorities {
+            rec.write(buffer)?;
         }
-        for resource in &self.resources {
-            resource.write(buffer)?;
+        for rec in &self.resources {
+            rec.write(buffer)?;
         }
 
         Ok(())
     }
 
-    /// Helper function to find a DNS record with the same domain and type in the answers section.
-    pub fn get_resolved_a(&self, qname: &str) -> Option<Ipv4Addr> {
-        self.answers.iter().find_map(|rec| {
-            if let DnsRecord::A { domain, addr, .. } = rec {
-                if qname.eq_ignore_ascii_case(domain) {
-                    return Some(*addr);
-                }
-            }
-            None
+    /// It's useful to be able to pick a random A record from a packet. When we
+    /// get multiple IP's for a single name, it doesn't matter which one we
+    /// choose, so in those cases we can now pick one at random.
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers.iter().find_map(|record| match record {
+            DnsRecord::A { addr, .. } => Some(*addr),
+            _ => None,
         })
     }
-    
-    /// Helper function to find any A record
-    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
-        self.answers.iter().filter_map(|rec| {
-            if let DnsRecord::A { addr, .. } = rec {
-                return Some(*addr);
-            }
-            None
-        }).next()
-    }
 
-    /// Helper function to find a NS record for a given domain in the authorities section.
-    pub fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+    /// A helper function which returns an iterator over all name servers in
+    /// the authorities section, represented as (domain, host) tuples
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
         self.authorities
             .iter()
-            .filter_map(move |rec| {
-                if let DnsRecord::NS { domain, host, .. } = rec {
-                    // Filter for NS records
-                    if qname.ends_with(domain) {
-                        return Some((domain.as_str(), host.as_str()));
-                    }
-                }
-                None
+            // In practice, these are always NS records in well formed packages.
+            // Convert the NS records to a tuple which has only the data we need
+            // to make it easy to work with.
+            .filter_map(|record| match record {
+                DnsRecord::NS { domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
             })
+            // Discard servers which aren't authoritative to our query
+            .filter(move |(domain, _)| qname.ends_with(*domain))
     }
 
-    /// Takes a `qname` and `query_type` and tries to find a resolved IP from the records.
-    pub fn get_ns_ip_from_additional(&self, qname: &str) -> Option<Ipv4Addr> {
+    /// We'll use the fact that name servers often bundle the corresponding
+    /// A records when replying to an NS query to implement a function that
+    /// returns the actual IP for an NS record if possible.
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<Ipv4Addr> {
+        // Get an iterator over the nameservers in the authorities section
         self.get_ns(qname)
+            // Now we need to look for a matching A record in the additional
+            // section. Since we just want the first valid record, we can just
+            // build a stream of matching records.
             .flat_map(|(_, host)| {
                 self.resources
                     .iter()
+                    // Filter for A records where the domain match the host
+                    // of the NS record that we are currently processing
                     .filter_map(move |record| match record {
                         DnsRecord::A { domain, addr, .. } if domain == host => Some(addr),
                         _ => None,
                     })
             })
             .map(|addr| *addr)
+            // Finally, pick the first valid entry
             .next()
     }
-    
-    /// Returns the host name of an appropriate name server.
+
+    /// However, not all name servers are as that nice. In certain cases there won't
+    /// be any A records in the additional section, and we'll have to perform *another*
+    /// lookup in the midst. For this, we introduce a method for returning the host
+    /// name of an appropriate name server.
     pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        // Get an iterator over the nameservers in the authorities section
         self.get_ns(qname)
             .map(|(_, host)| host)
+            // Finally, pick the first valid entry
             .next()
     }
 }

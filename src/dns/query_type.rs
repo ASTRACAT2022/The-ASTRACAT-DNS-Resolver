@@ -6,7 +6,6 @@ pub enum QueryType {
     CNAME, // 5
     MX,    // 15
     AAAA,  // 28
-    TXT,   // 16
 }
 
 impl QueryType {
@@ -18,7 +17,6 @@ impl QueryType {
             QueryType::CNAME => 5,
             QueryType::MX => 15,
             QueryType::AAAA => 28,
-            QueryType::TXT => 16,
         }
     }
 
@@ -28,7 +26,6 @@ impl QueryType {
             2 => QueryType::NS,
             5 => QueryType::CNAME,
             15 => QueryType::MX,
-            16 => QueryType::TXT,
             28 => QueryType::AAAA,
             _ => QueryType::UNKNOWN(num),
         }
