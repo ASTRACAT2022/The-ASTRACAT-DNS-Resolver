@@ -121,7 +121,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
         packet.write(&mut req_buffer)?;
         let req_bytes = req_buffer.get_range(0, req_buffer.pos())?;
 
-        let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.send_to(req_bytes, (current_nameserver, 53)).await?;
 
         let mut res_buffer = BytePacketBuffer::new();
@@ -168,14 +168,14 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
             }).collect();
 
             // Проверяем дополнительные A-записи для NS
-            let mut ns_ips: Vec<Ipv4Addr> = res_packet.resources.iter().filter_map(|rec| {
+            let ns_ips: Vec<Ipv4Addr> = res_packet.resources.iter().filter_map(|rec| {
                 if let DnsRecord::A { domain, addr, .. } = rec {
                     if ns_records.contains(domain) {
                         return Some(*addr);
                     }
                 }
                 None
-            }).collect();
+            }).collect(); // Removed `mut` from ns_ips
 
             if !ns_ips.is_empty() {
                 // Используем новые NS-серверы
@@ -346,13 +346,13 @@ async fn main() -> Result<()> {
         prometheus_exporter::start(exporter_addr).unwrap();
     });
 
-    let socket = UdpSocket::bind(("0.0.0.0", 5300)).await?;
+    let socket = UdpSocket::bind("0.0.0.0:5300").await?;
     let shared_socket = Arc::new(socket);
     println!("DNS-сервер запущен на порту 5300");
 
     let mut buffer = BytePacketBuffer::new();
     loop {
-        let (len, src) = shared_socket.recv_from(&mut buffer.buf).await?;
+        let (_len, src) = shared_socket.recv_from(&mut buffer.buf).await?; // Changed `len` to `_len`
         
         let req_buffer = buffer.clone();
         let socket_clone = Arc::clone(&shared_socket);
