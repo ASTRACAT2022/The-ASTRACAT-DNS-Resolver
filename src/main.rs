@@ -66,59 +66,23 @@ const ROOT_SERVERS: &[Ipv4Addr] = &[
 // Базовый кеш
 lazy_static! {
     static ref DNS_CACHE: Arc<parking_lot::RwLock<HashMap<(String, QueryType), (DnsPacket, Instant, u32)>>> =
-        Arc::new(parking_lot::RwLock::new(HashMap::new()));
-}
-
-// Проверка валидности домена
-fn is_valid_domain(qname: &str) -> bool {
-    if qname.is_empty() || qname.len() > 255 {
-        return false;
-    }
-    let labels = qname.split('.').collect::<Vec<&str>>();
-    if labels.is_empty() || labels.iter().any(|label| label.is_empty() || label.len() > 63) {
-        return false;
-    }
-    qname.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+        Arc::new(parking_lot::RwLock::new(HashMap::new())); // Добавлено поле TTL
 }
 
 #[async_recursion]
 async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth: u8) -> Result<DnsPacket> {
-    const MAX_DEPTH: u8 = 20;
+    const MAX_DEPTH: u8 = 20; // Увеличена максимальная глубина рекурсии
     if depth >= MAX_DEPTH {
         return Err("Превышена максимальная глубина поиска.".into());
     }
 
-    if !is_valid_domain(&qname) {
-        eprintln!("Невалидное доменное имя: {}", qname);
-        return Err("Невалидное доменное имя.".into());
-    }
-
-    // Проверяем кеш на наличие NXDOMAIN
-    {
-        let cache = DNS_CACHE.read();
-        if let Some((cached_packet, _, ttl)) = cache.get(&(qname.clone(), qtype)) {
-            if cached_packet.header.rescode == ResultCode::NXDOMAIN && Instant::now().elapsed().as_secs() < *ttl as u64 {
-                return Err(format!("Кэшированный NXDOMAIN для {}", qname).into());
-            }
-        }
-    }
-
-    let mut auth_servers: Vec<Ipv4Addr> = ROOT_SERVERS.to_vec();
-    auth_servers.shuffle(&mut rand::thread_rng());
+    // Список корневых серверов для перебора
+    let mut root_servers: Vec<Ipv4Addr> = ROOT_SERVERS.to_vec();
+    root_servers.shuffle(&mut rand::thread_rng()); // Перемешиваем для равномерной нагрузки
     let mut current_nameserver = nameserver;
-    let mut tried_servers = vec![];
 
     loop {
-        if tried_servers.contains(&current_nameserver) {
-            if let Some(next_server) = auth_servers.pop() {
-                current_nameserver = next_server;
-                continue;
-            } else {
-                return Err(format!("Все доступные серверы для {} были опрошены.", qname).into());
-            }
-        }
-        tried_servers.push(current_nameserver);
-
+        // Логирование текущего запроса
         println!("Попытка запроса к {} для {} (тип: {:?}, глубина: {})", current_nameserver, qname, qtype, depth);
 
         let mut packet = DnsPacket::new();
@@ -131,30 +95,32 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
         packet.write(&mut req_buffer)?;
         let req_bytes = req_buffer.get_range(0, req_buffer.pos())?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
         socket.send_to(req_bytes, (current_nameserver, 53)).await?;
 
         let mut res_buffer = BytePacketBuffer::new();
-        let res = timeout(Duration::from_secs(5), socket.recv_from(&mut res_buffer.buf)).await;
+        let res = timeout(Duration::from_secs(5), socket.recv_from(&mut res_buffer.buf)).await; // Увеличен тайм-аут до 5 секунд
 
         let (_len, _src) = match res {
             Ok(Ok(val)) => val,
             Ok(Err(e)) => {
                 eprintln!("Ошибка сокета для {}: {}", current_nameserver, e);
-                if let Some(next_server) = auth_servers.pop() {
+                // Пробуем следующий корневой сервер
+                if let Some(next_server) = root_servers.pop() {
                     current_nameserver = next_server;
                     continue;
                 } else {
-                    return Err(format!("Все серверы недоступны: {}", e).into());
+                    return Err(format!("Все корневые серверы недоступны: {}", e).into());
                 }
             }
             Err(_) => {
                 eprintln!("Тайм-аут для сервера {}", current_nameserver);
-                if let Some(next_server) = auth_servers.pop() {
+                // Пробуем следующий корневой сервер
+                if let Some(next_server) = root_servers.pop() {
                     current_nameserver = next_server;
                     continue;
                 } else {
-                    return Err("Все серверы недоступны (тайм-аут).".into());
+                    return Err("Все корневые серверы недоступны (тайм-аут).".into());
                 }
             }
         };
@@ -167,55 +133,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
         }
 
         if res_packet.header.rescode == ResultCode::NXDOMAIN {
-            // Кэшируем NXDOMAIN с TTL 60 секунд
-            let mut cache = DNS_CACHE.write();
-            cache.insert((qname.clone(), qtype), (res_packet.clone(), Instant::now(), 60));
-
-            // Собираем все NS-записи из секции AUTHORITY
-            let ns_records: Vec<String> = res_packet.authorities.iter().filter_map(|rec| {
-                if let DnsRecord::NS { domain, host, .. } = rec {
-                    if qname.ends_with(domain) {
-                        return Some(host.clone());
-                    }
-                }
-                None
-            }).collect();
-
-            // Проверяем дополнительные A-записи для NS
-            let ns_ips: Vec<Ipv4Addr> = res_packet.resources.iter().filter_map(|rec| {
-                if let DnsRecord::A { domain, addr, .. } = rec {
-                    if ns_records.contains(domain) {
-                        return Some(*addr);
-                    }
-                }
-                None
-            }).collect();
-
-            if !ns_ips.is_empty() {
-                // Используем новые NS-серверы
-                auth_servers = ns_ips;
-                auth_servers.shuffle(&mut rand::thread_rng());
-                tried_servers.clear();
-                current_nameserver = auth_servers.pop().unwrap_or(current_nameserver);
-                continue;
-            } else if !ns_records.is_empty() {
-                // Запрашиваем IP для NS-записей
-                for ns in ns_records {
-                    let ns_ip_packet = lookup(ns.clone(), QueryType::A, current_nameserver, depth + 1).await;
-                    if let Ok(ns_ip_packet) = ns_ip_packet {
-                        if let Some(ns_ip) = ns_ip_packet.get_random_a() {
-                            auth_servers.push(ns_ip);
-                        }
-                    }
-                }
-                if !auth_servers.is_empty() {
-                    auth_servers.shuffle(&mut rand::thread_rng());
-                    tried_servers.clear();
-                    current_nameserver = auth_servers.pop().unwrap_or(current_nameserver);
-                    continue;
-                }
-            }
-            return Err(format!("Домен не существует (NXDOMAIN) для всех серверов зоны: {}", qname).into());
+            return Err("Домен не существует.".into());
         }
 
         if let Some(cname_record) = res_packet.answers.iter().find_map(|rec| {
@@ -227,7 +145,6 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
             None
         }) {
             qname = cname_record;
-            tried_servers.clear();
             continue;
         }
 
@@ -256,11 +173,10 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
                     return Err(format!("Не удалось разрешить NS-запись для {}", ns_record).into());
                 }
             }
-            tried_servers.clear();
             continue;
         }
 
-        return Err(format!("Не найдено ответов, CNAME или NS-записей для {}.", qname).into());
+        return Err("Не найдено ответов, CNAME или NS-записей.".into());
     }
 }
 
@@ -275,58 +191,53 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
     res_packet.header.response = true;
 
     if let Some(question) = req_packet.questions.get(0) {
-        if !is_valid_domain(&question.name) {
-            eprintln!("Невалидное доменное имя в запросе: {}", question.name);
-            res_packet.header.rescode = ResultCode::FORMERR;
-        } else {
-            res_packet.questions.push(question.clone());
+        res_packet.questions.push(question.clone());
 
-            // Проверяем кеш
-            {
-                let cache = DNS_CACHE.read();
-                if let Some((cached_packet, _, ttl)) = cache.get(&(question.name.clone(), question.qtype)) {
-                    if start_time.elapsed().as_secs() < *ttl as u64 {
-                        res_packet.answers = cached_packet.answers.clone();
-                        res_packet.header.rescode = cached_packet.header.rescode; // Учитываем NXDOMAIN из кэша
-                        DNS_CACHE_HITS_TOTAL.with_label_values(&[&question.qtype.to_string()]).inc();
-                        // Если это NXDOMAIN, возвращаем ошибку
-                        if res_packet.header.rescode == ResultCode::NXDOMAIN {
-                            return Err(format!("Кэшированный NXDOMAIN для {}", question.name).into());
-                        }
-                    }
+        // Проверяем кеш
+        {
+            let cache = DNS_CACHE.read();
+            if let Some((cached_packet, _, ttl)) = cache.get(&(question.name.clone(), question.qtype)) {
+                if start_time.elapsed().as_secs() < *ttl as u64 {
+                    // Кеш действителен
+                    res_packet.answers = cached_packet.answers.clone();
+                    res_packet.header.rescode = ResultCode::NOERROR;
+                    DNS_CACHE_HITS_TOTAL.with_label_values(&["A"]).inc();
                 }
             }
+        }
 
-            if res_packet.answers.is_empty() {
-                DNS_CACHE_MISSES_TOTAL.with_label_values(&[&question.qtype.to_string()]).inc();
-                
-                let root_server = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
+        if res_packet.answers.is_empty() {
+            // Кеш промахнулся или устарел
+            DNS_CACHE_MISSES_TOTAL.with_label_values(&["A"]).inc();
+            
+            // Выбираем случайный корневой сервер
+            let root_server = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
 
-                match lookup(question.name.clone(), question.qtype, root_server, 0).await {
-                    Ok(answers) => {
-                        res_packet.header.rescode = ResultCode::NOERROR;
-                        res_packet.answers = answers.answers.clone();
-                        res_packet.header.answers = res_packet.answers.len() as u16;
-                        
-                        let ttl = answers
-                            .answers
-                            .iter()
-                            .filter_map(|record| match record {
-                                DnsRecord::A { ttl, .. } => Some(*ttl),
-                                DnsRecord::CNAME { ttl, .. } => Some(*ttl),
-                                DnsRecord::AAAA { ttl, .. } => Some(*ttl),
-                                _ => None,
-                            })
-                            .min()
-                            .unwrap_or(600);
+            match lookup(question.name.clone(), question.qtype, root_server, 0).await {
+                Ok(answers) => {
+                    res_packet.header.rescode = ResultCode::NOERROR;
+                    res_packet.answers = answers.answers.clone();
+                    res_packet.header.answers = res_packet.answers.len() as u16;
+                    
+                    // Получаем минимальный TTL из ответов
+                    let ttl = answers
+                        .answers
+                        .iter()
+                        .filter_map(|record| match record {
+                            DnsRecord::A { ttl, .. } => Some(*ttl),
+                            DnsRecord::CNAME { ttl, .. } => Some(*ttl),
+                            _ => None,
+                        })
+                        .min()
+                        .unwrap_or(600);
 
-                        let mut cache = DNS_CACHE.write();
-                        cache.insert((question.name.clone(), question.qtype), (answers, Instant::now(), ttl));
-                    }
-                    Err(e) => {
-                        eprintln!("Ошибка при разрешении домена '{}': {}", question.name, e);
-                        res_packet.header.rescode = ResultCode::SERVFAIL;
-                    }
+                    // Добавляем в кеш
+                    let mut cache = DNS_CACHE.write();
+                    cache.insert((question.name.clone(), question.qtype), (answers, Instant::now(), ttl));
+                }
+                Err(e) => {
+                    eprintln!("Ошибка при разрешении домена '{}': {}", question.name, e);
+                    res_packet.header.rescode = ResultCode::SERVFAIL;
                 }
             }
         }
@@ -358,19 +269,20 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Запускаем экспортер Prometheus
     let exporter_addr = "0.0.0.0:9090".parse().unwrap();
     println!("Экспортер Prometheus запущен на {}", exporter_addr);
     tokio::spawn(async move {
         prometheus_exporter::start(exporter_addr).unwrap();
     });
 
-    let socket = UdpSocket::bind("0.0.0.0:5300").await?;
+    let socket = UdpSocket::bind(("0.0.0.0", 5300)).await?;
     let shared_socket = Arc::new(socket);
     println!("DNS-сервер запущен на порту 5300");
 
     let mut buffer = BytePacketBuffer::new();
     loop {
-        let (_len, src) = shared_socket.recv_from(&mut buffer.buf).await?;
+        let (len, src) = shared_socket.recv_from(&mut buffer.buf).await?;
         
         let req_buffer = buffer.clone();
         let socket_clone = Arc::clone(&shared_socket);
