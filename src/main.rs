@@ -157,7 +157,6 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             }
             continue;
         }
-        }
 
         if let Some(ns_record) = res_packet.authorities.iter().find_map(|rec| {
             if let DnsRecord::NS { domain, host, .. } = rec {
