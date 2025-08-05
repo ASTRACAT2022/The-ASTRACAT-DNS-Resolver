@@ -159,6 +159,8 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
                 }
                 None
             }) {
+                current_nameserver = *ip;
+            } else {
                 current_nameserver = ip;
             } else {
                 let ns_pkt = lookup(ns.clone(), QueryType::A, current_nameserver).await?;
