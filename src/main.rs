@@ -146,13 +146,14 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             continue;
         }
 
-        if let Some(ns) = res_packet.authorities.iter().find_map(|rec| {
+                if let Some(ns) = res_packet.authorities.iter().find_map(|rec| {
             if let DnsRecord::NS { domain, host, .. } = rec {
                 if qname.ends_with(domain) { return Some(host.clone()); }
             }
             None
         }) {
             eprintln!("[lookup] NS {} for {}", ns, qname);
+            // попробуем найти A-запись в resources
             if let Some(ip) = res_packet.resources.iter().find_map(|rec| {
                 if let DnsRecord::A { domain, addr, .. } = rec {
                     if domain == &ns { return Some(addr); }
@@ -161,13 +162,18 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             }) {
                 current_nameserver = *ip;
             } else {
-                current_nameserver = ip;
-            } else {
+                // рекурсивно разрешаем NS
                 let ns_pkt = lookup(ns.clone(), QueryType::A, current_nameserver).await?;
-                if let Some(ip) = ns_pkt.get_random_a() { current_nameserver = ip; }
-                else { eprintln!("[lookup] no A for NS {}", ns); return Err("Failed NS lookup".into()); }
+                if let Some(ip) = ns_pkt.get_random_a() {
+                    current_nameserver = ip;
+                } else {
+                    eprintln!("[lookup] no A for NS {}", ns);
+                    return Err("Failed NS lookup".into());
+                }
             }
             continue;
+        }
+
         }
 
         eprintln!("[lookup] no answers/CNAME/NS for {}", qname);
