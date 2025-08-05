@@ -38,69 +38,6 @@ lazy_static::lazy_static! {
         Arc::new(parking_lot::RwLock::new(HashMap::new()));
 }
 
-// Добавляем отсутствующие методы напрямую в main.rs
-impl DnsPacket {
-    /// Возвращает случайный IP-адрес из записей типа A в разделе ответов.
-    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
-        self.answers
-            .iter()
-            .filter_map(|rec| {
-                if let DnsRecord::A { addr, .. } = rec {
-                    Some(*addr)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<Ipv4Addr>>()
-            .choose(&mut rand::thread_rng())
-            .copied()
-    }
-
-    /// Ищет IP-адрес NS-сервера в дополнительном разделе на основе имени хоста NS-сервера.
-    pub fn get_ns_ip_from_additional(&self, qname: &str) -> Option<Ipv4Addr> {
-        self.get_ns(qname)
-            .flat_map(|(_, host)| {
-                self.resources
-                    .iter()
-                    .filter_map(move |record| {
-                        if let DnsRecord::A { domain, addr, .. } = record {
-                            if domain == host {
-                                return Some(*addr);
-                            }
-                        }
-                        None
-                    })
-            })
-            .next()
-    }
-    
-    /// Ищет авторитативный сервер имен (NS) в разделе авторитетных записей.
-    /// Возвращает имя хоста наиболее подходящего NS-сервера.
-    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
-        self.get_ns(qname)
-            .map(|(_, host)| host)
-            .next()
-    }
-
-    /// Вспомогательный метод для поиска NS-записей, соответствующих домену.
-    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
-        self.authorities
-            .iter()
-            .filter_map(|rec| {
-                if let DnsRecord::NS { domain, host, .. } = rec {
-                    if qname.ends_with(domain) {
-                        Some((domain.as_str(), host.as_str()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-    }
-}
-
-
 #[async_recursion]
 async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Result<DnsPacket> {
     const MAX_DEPTH: u8 = 10;
