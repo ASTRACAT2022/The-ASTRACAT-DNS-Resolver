@@ -93,6 +93,16 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
         return Err("Невалидное доменное имя.".into());
     }
 
+    // Проверяем кеш на наличие NXDOMAIN
+    {
+        let cache = DNS_CACHE.read();
+        if let Some((cached_packet, _, ttl)) = cache.get(&(qname.clone(), qtype)) {
+            if cached_packet.header.rescode == ResultCode::NXDOMAIN && Instant::now().elapsed().as_secs() < *ttl as u64 {
+                return Err(format!("Кэшированный NXDOMAIN для {}", qname).into());
+            }
+        }
+    }
+
     let mut auth_servers: Vec<Ipv4Addr> = ROOT_SERVERS.to_vec();
     auth_servers.shuffle(&mut rand::thread_rng());
     let mut current_nameserver = nameserver;
@@ -157,6 +167,10 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
         }
 
         if res_packet.header.rescode == ResultCode::NXDOMAIN {
+            // Кэшируем NXDOMAIN с TTL 60 секунд
+            let mut cache = DNS_CACHE.write();
+            cache.insert((qname.clone(), qtype), (res_packet.clone(), Instant::now(), 60));
+
             // Собираем все NS-записи из секции AUTHORITY
             let ns_records: Vec<String> = res_packet.authorities.iter().filter_map(|rec| {
                 if let DnsRecord::NS { domain, host, .. } = rec {
@@ -175,7 +189,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr, depth
                     }
                 }
                 None
-            }).collect(); // Removed `mut` from ns_ips
+            }).collect();
 
             if !ns_ips.is_empty() {
                 // Используем новые NS-серверы
@@ -273,8 +287,12 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, req_buffer: ByteP
                 if let Some((cached_packet, _, ttl)) = cache.get(&(question.name.clone(), question.qtype)) {
                     if start_time.elapsed().as_secs() < *ttl as u64 {
                         res_packet.answers = cached_packet.answers.clone();
-                        res_packet.header.rescode = ResultCode::NOERROR;
+                        res_packet.header.rescode = cached_packet.header.rescode; // Учитываем NXDOMAIN из кэша
                         DNS_CACHE_HITS_TOTAL.with_label_values(&[&question.qtype.to_string()]).inc();
+                        // Если это NXDOMAIN, возвращаем ошибку
+                        if res_packet.header.rescode == ResultCode::NXDOMAIN {
+                            return Err(format!("Кэшированный NXDOMAIN для {}", question.name).into());
+                        }
                     }
                 }
             }
@@ -352,7 +370,7 @@ async fn main() -> Result<()> {
 
     let mut buffer = BytePacketBuffer::new();
     loop {
-        let (_len, src) = shared_socket.recv_from(&mut buffer.buf).await?; // Changed `len` to `_len`
+        let (_len, src) = shared_socket.recv_from(&mut buffer.buf).await?;
         
         let req_buffer = buffer.clone();
         let socket_clone = Arc::clone(&shared_socket);
