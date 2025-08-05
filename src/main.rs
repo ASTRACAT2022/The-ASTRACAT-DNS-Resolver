@@ -89,6 +89,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             return Err("Домен не существует (NXDOMAIN).".into());
         }
 
+        // Если в ответе есть запись CNAME, повторяем поиск для нового имени
         if let Some(cname_record) = res_packet.answers.iter().find_map(|rec| {
             if let DnsRecord::CNAME { domain, host, .. } = rec {
                 if qname.eq_ignore_ascii_case(domain) {
@@ -103,11 +104,13 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             continue;
         }
 
+        // Ищем IP-адрес для NS-сервера в дополнительной секции
         if let Some(ns_ip) = res_packet.get_ns_ip_from_additional(&qname) {
             current_nameserver = ns_ip;
             continue;
         }
         
+        // Ищем имя авторитативного сервера и выполняем новый поиск для его IP
         if let Some(ns_host) = res_packet.get_authoritative_ns(&qname) {
             let root_server = *ROOT_SERVERS.choose(&mut rand::thread_rng()).unwrap();
             let ns_ip_packet = lookup(ns_host.clone(), QueryType::A, root_server).await?;
@@ -121,44 +124,6 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
         }
 
         return Err("Не найдено ответов или авторитативных серверов для продолжения.".into());
-    }
-}
-
-// ДОБАВЛЕНО: Вспомогательные функции для DnsPacket, чтобы сделать код чище
-impl DnsPacket {
-    /// Ищет IP-адрес для NS-сервера в дополнительной секции (glue record)
-    fn get_ns_ip_from_additional(&self, qname: &str) -> Option<Ipv4Addr> {
-        self.authorities
-            .iter()
-            .filter_map(|rec| match rec {
-                DnsRecord::NS { domain, host, .. } if qname.ends_with(domain) => Some(host),
-                _ => None,
-            })
-            .flat_map(|ns_host| {
-                self.resources.iter().filter_map(move |rec| match rec {
-                    DnsRecord::A { domain, addr, .. } if domain == ns_host => Some(*addr),
-                    _ => None,
-                })
-            })
-            .next()
-    }
-    
-    /// Ищет имя авторитативного сервера в секции authorities
-    fn get_authoritative_ns(&self, qname: &str) -> Option<String> {
-        self.authorities
-            .iter()
-            .find_map(|rec| match rec {
-                 DnsRecord::NS { domain, host, .. } if qname.ends_with(domain) => Some(host.clone()),
-                _ => None,
-            })
-    }
-
-    /// Ищет случайную A-запись в ответах
-    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
-        self.answers.iter().find_map(|record| match record {
-            DnsRecord::A { addr, .. } => Some(*addr),
-            _ => None
-        })
     }
 }
 
@@ -196,9 +161,18 @@ async fn handle_query(socket: Arc<UdpSocket>, src: SocketAddr, mut req_buffer: B
                     res_packet.answers = lookup_result.answers.clone();
                     res_packet.header.answers = res_packet.answers.len() as u16;
                     
-                    let min_ttl = lookup_result.answers
+                    // Исправлено: Используем сопоставление с образцом для получения TTL
+                    let min_ttl = lookup_result
+                        .answers
                         .iter()
-                        .map(|rec| rec.ttl())
+                        .filter_map(|rec| match rec {
+                            DnsRecord::A { ttl, .. } => Some(*ttl),
+                            DnsRecord::AAAA { ttl, .. } => Some(*ttl),
+                            DnsRecord::CNAME { ttl, .. } => Some(*ttl),
+                            DnsRecord::MX { ttl, .. } => Some(*ttl),
+                            DnsRecord::NS { ttl, .. } => Some(*ttl),
+                            DnsRecord::UNKNOWN { ttl, .. } => Some(*ttl),
+                        })
                         .min()
                         .unwrap_or(0);
 
