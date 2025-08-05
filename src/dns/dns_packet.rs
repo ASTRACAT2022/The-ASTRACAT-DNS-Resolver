@@ -60,7 +60,7 @@ impl DnsPacket {
     }
 
     /// Записывает DNS-пакет в байтовый буфер.
-    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
         self.header.questions = self.questions.len() as u16;
         self.header.answers = self.answers.len() as u16;
         self.header.authoritative_entries = self.authorities.len() as u16;
@@ -143,5 +143,49 @@ impl DnsPacket {
                     None
                 }
             })
+    }
+
+    /// Возвращает итератор по всем записям A (IPv4) в разделе ответов.
+    pub fn answers_a(&self) -> impl Iterator<Item = &Ipv4Addr> {
+        self.answers.iter().filter_map(|rec| {
+            if let DnsRecord::A { addr, .. } = rec {
+                Some(addr)
+            } else {
+                None
+            }
+        })
+    }
+    
+    /// Возвращает итератор по всем записям NS (серверы имен) в разделе авторитетов.
+    pub fn authorities_ns(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.authorities.iter().filter_map(|rec| {
+            if let DnsRecord::NS { domain, host, .. } = rec {
+                Some((domain.as_str(), host.as_str()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Возвращает итератор по всем записям TXT в разделе ответов.
+    pub fn answers_txt(&self) -> impl Iterator<Item = &str> {
+        self.answers.iter().filter_map(|rec| {
+            if let DnsRecord::TXT { data, .. } = rec {
+                Some(data.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Возвращает итератор по всем записям MX в разделе ответов.
+    pub fn answers_mx(&self) -> impl Iterator<Item = (&str, u16)> {
+        self.answers.iter().filter_map(|rec| {
+            if let DnsRecord::MX { host, priority, .. } = rec {
+                Some((host.as_str(), *priority))
+            } else {
+                None
+            }
+        })
     }
 }
