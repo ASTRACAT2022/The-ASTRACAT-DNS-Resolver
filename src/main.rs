@@ -137,8 +137,26 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             None
         }) {
             eprintln!("[lookup] CNAME: {} -> {}", qname, cname_record);
-            qname = cname_record;
+            qname = cname_record.clone();
+            // Попытаться найти A-запись для CNAME в ответах и additional (цепочка CNAME)
+            if let Some(a_addr) = res_packet.answers.iter().chain(res_packet.additional.iter()).find_map(|rec| {
+                if let DnsRecord::A { domain, addr, .. } = rec {
+                    if domain == &cname_record {
+                        return Some(*addr);
+                    }
+                }
+                None
+            }) {
+                eprintln!("[lookup] Найдена A-запись для CNAME {} -> {}", cname_record, a_addr);
+                // Возвращаем пакет с цепочкой CNAME и A
+                let mut final_pkt = DnsPacket::new();
+                final_pkt.header = res_packet.header.clone();
+                final_pkt.answers.push(DnsRecord::CNAME { domain: qname.clone(), host: cname_record.clone(), ttl: 0 });
+                final_pkt.answers.push(DnsRecord::A { domain: cname_record.clone(), addr: a_addr, ttl: 0 });
+                return Ok(final_pkt);
+            }
             continue;
+        }
         }
 
         if let Some(ns_record) = res_packet.authorities.iter().find_map(|rec| {
@@ -150,7 +168,7 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
             None
         }) {
             eprintln!("[lookup] NS найден: {} для {}", ns_record, qname);
-            if let Some(a_record) = res_packet.resources.iter().find_map(|rec| {
+            if let Some(a_record) = res_packet.resources.iter().chain(res_packet.additional.iter()).find_map(|rec| {
                 if let DnsRecord::A { domain, addr, .. } = rec {
                     if domain == &ns_record {
                         return Some(*addr);
