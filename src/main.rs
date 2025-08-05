@@ -176,3 +176,6 @@ async fn lookup(mut qname: String, qtype: QueryType, nameserver: Ipv4Addr) -> Re
 
         eprintln!("[lookup] no answers/CNAME/NS for {}", qname);
         return Err("No usable records".into());
+        }
+    }
+}
