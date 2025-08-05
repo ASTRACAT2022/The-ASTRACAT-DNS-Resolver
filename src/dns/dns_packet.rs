@@ -1,13 +1,10 @@
-use std::net::Ipv4Addr;
-use rand::seq::SliceRandom;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::{
     byte_packet_buffer::BytePacketBuffer, dns_header::DnsHeader, dns_question::DnsQuestion,
     dns_record::DnsRecord, query_type::QueryType, Result,
 };
 
-/// Структура, представляющая полный DNS-пакет.
-/// Она содержит заголовок, вопросы, ответы, авторитетные записи и дополнительные ресурсы.
 #[derive(Clone, Debug)]
 pub struct DnsPacket {
     pub header: DnsHeader,
@@ -18,7 +15,6 @@ pub struct DnsPacket {
 }
 
 impl DnsPacket {
-    /// Создает новый пустой DNS-пакет.
     pub fn new() -> DnsPacket {
         DnsPacket {
             header: DnsHeader::new(),
@@ -29,8 +25,6 @@ impl DnsPacket {
         }
     }
 
-    /// Создает DNS-пакет из байтового буфера.
-    /// Этот метод читает все разделы пакета из буфера.
     pub fn from_buffer(buffer: &mut BytePacketBuffer) -> Result<DnsPacket> {
         let mut result = DnsPacket::new();
         result.header.read(buffer)?;
@@ -59,7 +53,6 @@ impl DnsPacket {
         Ok(result)
     }
 
-    /// Записывает DNS-пакет в байтовый буфер.
     pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
         self.header.questions = self.questions.len() as u16;
         self.header.answers = self.answers.len() as u16;
@@ -71,121 +64,75 @@ impl DnsPacket {
         for question in &self.questions {
             question.write(buffer)?;
         }
-
-        for record in &self.answers {
-            record.write(buffer)?;
+        for answer in &self.answers {
+            answer.write(buffer)?;
+        }
+        for auth in &self.authorities {
+            auth.write(buffer)?;
+        }
+        for resource in &self.resources {
+            resource.write(buffer)?;
         }
 
-        for record in &self.authorities {
-            record.write(buffer)?;
-        }
-
-        for record in &self.resources {
-            record.write(buffer)?;
-        }
         Ok(())
     }
 
-    /// Возвращает случайный IP-адрес из записей типа A в разделе ответов.
-    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
-        self.answers
-            .iter()
-            .filter_map(|rec| {
-                if let DnsRecord::A { addr, .. } = rec {
-                    Some(*addr)
-                } else {
-                    None
+    /// Helper function to find a DNS record with the same domain and type in the answers section.
+    pub fn get_resolved_a(&self, qname: &str) -> Option<Ipv4Addr> {
+        self.answers.iter().find_map(|rec| {
+            if let DnsRecord::A { domain, addr, .. } = rec {
+                if qname.eq_ignore_ascii_case(domain) {
+                    return Some(*addr);
                 }
-            })
-            .collect::<Vec<Ipv4Addr>>()
-            .choose(&mut rand::thread_rng())
-            .copied()
+            }
+            None
+        })
+    }
+    
+    /// Helper function to find any A record
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers.iter().filter_map(|rec| {
+            if let DnsRecord::A { addr, .. } = rec {
+                return Some(*addr);
+            }
+            None
+        }).next()
     }
 
-    /// Ищет IP-адрес NS-сервера в дополнительном разделе на основе имени хоста NS-сервера.
+    /// Helper function to find a NS record for a given domain in the authorities section.
+    pub fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.authorities
+            .iter()
+            .filter_map(move |rec| {
+                if let DnsRecord::NS { domain, host, .. } = rec {
+                    // Filter for NS records
+                    if qname.ends_with(domain) {
+                        return Some((domain.as_str(), host.as_str()));
+                    }
+                }
+                None
+            })
+    }
+
+    /// Takes a `qname` and `query_type` and tries to find a resolved IP from the records.
     pub fn get_ns_ip_from_additional(&self, qname: &str) -> Option<Ipv4Addr> {
         self.get_ns(qname)
             .flat_map(|(_, host)| {
                 self.resources
                     .iter()
-                    .filter_map(move |record| {
-                        if let DnsRecord::A { domain, addr, .. } = record {
-                            if domain == host {
-                                return Some(*addr);
-                            }
-                        }
-                        None
+                    .filter_map(move |record| match record {
+                        DnsRecord::A { domain, addr, .. } if domain == host => Some(addr),
+                        _ => None,
                     })
             })
+            .map(|addr| *addr)
             .next()
     }
-
-    /// Ищет авторитативный сервер имен (NS) в разделе авторитетных записей.
-    /// Возвращает имя хоста наиболее подходящего NS-сервера.
+    
+    /// Returns the host name of an appropriate name server.
     pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
         self.get_ns(qname)
             .map(|(_, host)| host)
             .next()
-    }
-
-    /// Вспомогательный метод для поиска NS-записей, соответствующих домену.
-    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
-        self.authorities
-            .iter()
-            .filter_map(|rec| {
-                if let DnsRecord::NS { domain, host, .. } = rec {
-                    if qname.ends_with(domain) {
-                        Some((domain.as_str(), host.as_str()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-    }
-
-    /// Возвращает итератор по всем записям A (IPv4) в разделе ответов.
-    pub fn answers_a(&self) -> impl Iterator<Item = &Ipv4Addr> {
-        self.answers.iter().filter_map(|rec| {
-            if let DnsRecord::A { addr, .. } = rec {
-                Some(addr)
-            } else {
-                None
-            }
-        })
-    }
-    
-    /// Возвращает итератор по всем записям NS (серверы имен) в разделе авторитетов.
-    pub fn authorities_ns(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.authorities.iter().filter_map(|rec| {
-            if let DnsRecord::NS { domain, host, .. } = rec {
-                Some((domain.as_str(), host.as_str()))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Возвращает итератор по всем записям TXT в разделе ответов.
-    pub fn answers_txt(&self) -> impl Iterator<Item = &str> {
-        self.answers.iter().filter_map(|rec| {
-            if let DnsRecord::TXT { data, .. } = rec {
-                Some(data.as_str())
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Возвращает итератор по всем записям MX в разделе ответов.
-    pub fn answers_mx(&self) -> impl Iterator<Item = (&str, u16)> {
-        self.answers.iter().filter_map(|rec| {
-            if let DnsRecord::MX { host, priority, .. } = rec {
-                Some((host.as_str(), *priority))
-            } else {
-                None
-            }
-        })
     }
 }
