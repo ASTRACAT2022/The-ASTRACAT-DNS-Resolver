@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/miekg/dns"
 	"github.com/domainr/dnsr"
+	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -38,7 +38,7 @@ type handler struct{}
 func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	// Инкрементируем счётчик общего количества запросов
 	dnsQueriesTotal.Inc()
-	
+
 	go func() {
 		m := new(dns.Msg)
 		m.SetReply(r)
@@ -65,15 +65,22 @@ func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			return
 		}
 
+		// ----- ИСПРАВЛЕННЫЙ БЛОК (ВЕРСИЯ 2) -----
 		for _, rr := range records {
-			parsedRR, err := dns.NewRR(rr.String())
+			// Вручную собираем RR-запись в правильном формате, чтобы избежать ошибки парсинга.
+			// Стандартный формат: Name TTL IN Type Value
+			rrString := fmt.Sprintf("%s %d IN %s %s", rr.Name, int(rr.TTL.Seconds()), rr.Type, rr.Value)
+
+			parsedRR, err := dns.NewRR(rrString)
 			if err != nil {
-				log.Printf("Error parsing RR %s: %s", rr.String(), err)
+				// Этот лог теперь будет более информативным в случае ошибки
+				log.Printf("Error parsing manually constructed RR '%s': %s", rrString, err)
 				dnsQueriesErrors.Inc()
 				continue
 			}
 			m.Answer = append(m.Answer, parsedRR)
 		}
+		// ------------------------------------
 
 		if err := w.WriteMsg(m); err != nil {
 			log.Printf("Error writing message: %s", err)
@@ -105,7 +112,7 @@ func main() {
 
 	server.Handler = &handler{}
 	fmt.Println("DNS server is listening on :8053")
-	
+
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to start DNS server: %s", err)
 	}
